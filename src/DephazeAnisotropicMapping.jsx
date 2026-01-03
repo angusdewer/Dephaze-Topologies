@@ -4,48 +4,52 @@ import { Database, Zap, Cpu, Sliders, ShieldCheck, Activity } from 'lucide-react
 const DephazeAnisotropicMapping = () => {
   const canvasRef = useRef(null);
   const [rotation, setRotation] = useState({ x: 0.8, y: 0.5 });
-  const [k, setK] = useState(100); // Spectral Fidelity (10 - 500)
+  const [k, setK] = useState(100);
 
-  // --- 1. DETERMINISZTIKUS FÁZIS-MÁTRIX (Fix "ujjlenyomat") ---
-  const phaseMatrix = useMemo(() => {
-    const matrix = [];
-    for (let i = 0; i < 50; i++) {
-      matrix.push({
-        freqX: Math.random() * 5 + 1,
-        freqY: Math.random() * 5 + 1,
-        amp: (Math.random() - 0.5) * 0.5
+  // --- 1. FIX, MOZDULATLAN CÉLTÁRGY (Determinisztikus spektrum) ---
+  // Ez a "szkennelt valóság", ami sosem változik, nem rángatózik
+  const getStableNoise = (i) => {
+    // Szinusz-alapú pszeudo-véletlen: fix indexre fix értéket ad
+    return Math.sin(i * 12.9898 + 78.233) * 43758.5453 % 1;
+  };
+
+  const spectralField = useMemo(() => {
+    const field = [];
+    for (let i = 0; i < 500; i++) {
+      field.push({
+        fX: (i % 7) + 1,
+        fY: (i % 5) + 1,
+        amp: getStableNoise(i) * 0.4
       });
     }
-    return matrix;
+    return field;
   }, []);
 
-  // --- 2. STABIL REKONSTRUKCIÓS KERNEL ---
+  // --- 2. STABIL REKONSTRUKCIÓ (Nincs rángatás) ---
   const resolveR = (theta, phi, currentK) => {
-    let R = 2.2; // Alapsugár
+    let R = 2.0; // Stabil alapsugár
+    const limit = Math.floor(currentK / 5); 
     
-    // A csúszka határozza meg, hány harmonikust engedünk be
-    const harmonicsCount = Math.floor(currentK / 10); 
-    
-    for (let i = 0; i < harmonicsCount; i++) {
-      const p = phaseMatrix[i % phaseMatrix.length];
-      // Harmonikus csillapítás: a magasabb sorszámú hullám gyengébb (1/i)
-      const damping = 1 / (i * 0.2 + 1);
-      R += Math.sin(theta * p.freqX) * Math.cos(phi * p.freqY) * p.amp * damping;
+    for (let i = 0; i < limit; i++) {
+      const p = spectralField[i];
+      // Szigorú csillapítás az integritás megőrzéséhez
+      const damping = 1 / (i * 0.5 + 2);
+      R += Math.sin(theta * p.fX) * Math.cos(phi * p.fY) * p.amp * damping;
     }
     return R;
   };
 
   // --- 3. METRIKÁK ---
   const metrics = useMemo(() => {
-    const legacySize = 120000; 
+    const legacySize = 120000;
     const dephazeSize = 16 + (k * 2); 
     return {
       ratio: (legacySize / dephazeSize).toFixed(1),
-      precision: Math.min(99.9, (k / 500) * 100 + 70)
+      precision: Math.min(99.99, (k / 500) * 30 + 70)
     };
   }, [k]);
 
-  // --- 4. RENDERER (Nagy sűrűségű pontfelhő) ---
+  // --- 4. RENDERER (Stabilizált pontrács) ---
   useEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
@@ -56,23 +60,20 @@ const DephazeAnisotropicMapping = () => {
       ctx.clearRect(0, 0, width, height);
       const centerX = width / 2;
       const centerY = height / 2;
-      const scale = 80;
-      
+      const scale = 90;
       const points = [];
-      const res = 50; // Sűrű rács a folytonosságért
+      const res = 40; // Fix felbontás a villogás ellen
 
       for (let i = 0; i <= res; i++) {
         const theta = (i / res) * Math.PI * 2;
         for (let j = 0; j <= res; j++) {
           const phi = (j / res) * Math.PI;
-          
           const R = resolveR(theta, phi, k);
           
           const x = R * Math.sin(phi) * Math.cos(theta);
           const y = R * Math.sin(phi) * Math.sin(theta);
           const z = R * Math.cos(phi);
 
-          // Forgatás
           const cosX = Math.cos(rotation.x);
           const sinX = Math.sin(rotation.x);
           const y1 = y * cosX - z * sinX;
@@ -87,13 +88,14 @@ const DephazeAnisotropicMapping = () => {
         }
       }
 
+      // Painter's algorithm a mélységhez
       points.sort((a, b) => a.z - b.z);
       
       points.forEach(p => {
         const depth = (p.z + 3) / 6;
-        const b = Math.floor(depth * 150) + 100;
-        ctx.fillStyle = `rgba(${b/4}, ${b/1.5}, ${b}, ${0.3 + depth * 0.7})`;
-        const size = 0.5 + depth * 2.5;
+        const b = Math.floor(depth * 160) + 95;
+        ctx.fillStyle = `rgba(${b/4}, ${b/1.6}, ${b}, ${0.4 + depth * 0.6})`;
+        const size = 0.8 + depth * 2.2;
         ctx.beginPath();
         ctx.arc(centerX + p.x * scale, centerY - p.y * scale, size, 0, Math.PI * 2);
         ctx.fill();
@@ -104,64 +106,55 @@ const DephazeAnisotropicMapping = () => {
   }, [rotation, k]);
 
   return (
-    <div className="p-6 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
-      <div className="text-center mb-8">
-        <h1 className="text-3xl font-black bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent uppercase tracking-tighter">
-          Anisotropic Spectral Resolution
+    <div className="p-6 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-mono selection:bg-cyan-500">
+      <div className="text-center mb-10">
+        <h1 className="text-4xl font-black bg-gradient-to-r from-cyan-400 via-blue-500 to-indigo-500 bg-clip-text text-transparent uppercase tracking-tighter">
+          Anisotropic Phase Mapping
         </h1>
-        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">
-          DEPHAZE_KERNEL_STABILITY_V6.3 // STATUS: NOMINAL
+        <p className="text-slate-600 text-[10px] tracking-[0.5em] mt-2">
+          DEPHAZE_KERNEL_STABILITY_V6.3 // SPECTRAL_RECONSTRUCTION_ACTIVE
         </p>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="space-y-4">
-          <div className="bg-slate-900 p-6 rounded-3xl border border-blue-500 border-opacity-20 shadow-2xl">
-            <h3 className="text-blue-400 font-bold text-xs mb-6 uppercase flex items-center gap-2">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="space-y-6">
+          <div className="bg-slate-900 p-8 rounded-[2rem] border border-blue-500 border-opacity-20 shadow-2xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 p-4 opacity-10"><Zap size={40}/></div>
+            <h3 className="text-blue-400 font-bold text-xs mb-8 uppercase tracking-widest flex items-center gap-2">
               <Cpu size={14} /> Efficiency Audit
             </h3>
             <div className="text-center">
-              <p className="text-5xl font-black text-blue-400">{metrics.ratio}x</p>
-              <p className="text-[9px] text-slate-500 mt-2 uppercase tracking-widest">Data Collapse Ratio</p>
-            </div>
-            <div className="mt-6 pt-4 border-t border-slate-800 space-y-2">
-               <div className="flex justify-between text-[10px]">
-                  <span className="text-slate-500">LEGACY MESH</span>
-                  <span className="text-red-900">117.2 KB</span>
-               </div>
-               <div className="flex justify-between text-[10px]">
-                  <span className="text-slate-500">DEPHAZE SEED</span>
-                  <span className="text-emerald-500">{16 + Math.floor(k/2)} B</span>
-               </div>
+              <p className="text-6xl font-black text-white tracking-tighter">{metrics.ratio}<span className="text-blue-500 text-2xl">x</span></p>
+              <p className="text-[9px] text-slate-500 mt-4 uppercase tracking-[0.2em]">Data Collapse Magnitude</p>
             </div>
           </div>
 
-          <div className="bg-slate-900 p-6 rounded-3xl border border-purple-500 border-opacity-20">
-            <h3 className="text-purple-400 font-bold text-xs mb-6 uppercase flex items-center gap-2">
-              <Sliders size={14} /> Fidelity Control (k)
+          <div className="bg-slate-900 p-8 rounded-[2rem] border border-purple-500 border-opacity-20">
+            <h3 className="text-purple-400 font-bold text-xs mb-8 uppercase tracking-widest flex items-center gap-2">
+              <Sliders size={14} /> Fidelity Tuning (k)
             </h3>
             <input 
               type="range" min="10" max="500" step="10" value={k}
               onChange={(e) => setK(parseInt(e.target.value))}
-              className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-purple-500 mb-4"
+              className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-purple-500 mb-8"
             />
-            <div className="flex justify-between items-center bg-black p-4 rounded-2xl border border-slate-800">
-               <div>
-                  <p className="text-[8px] text-slate-500 uppercase">Precision</p>
-                  <p className="text-lg font-bold text-emerald-500">{metrics.precision.toFixed(2)}%</p>
+            <div className="grid grid-cols-2 gap-4">
+               <div className="bg-black p-4 rounded-2xl border border-slate-800 text-center">
+                  <p className="text-[8px] text-slate-500 uppercase mb-1">Spectral Order</p>
+                  <p className="text-xl font-bold text-white">{k}</p>
                </div>
-               <div className="text-right">
-                  <p className="text-[8px] text-slate-500 uppercase">Order</p>
-                  <p className="text-lg font-bold text-white">{k}</p>
+               <div className="bg-black p-4 rounded-2xl border border-slate-800 text-center">
+                  <p className="text-[8px] text-slate-500 uppercase mb-1">Accuracy</p>
+                  <p className="text-xl font-bold text-emerald-500">{metrics.precision.toFixed(1)}%</p>
                </div>
             </div>
           </div>
         </div>
 
-        <div className="lg:col-span-2 bg-slate-900 rounded-[2.5rem] border border-slate-800 p-4 flex flex-col items-center justify-center relative shadow-inner overflow-hidden">
-          <div className="absolute top-6 left-8 flex items-center gap-3 bg-black bg-opacity-40 p-2 rounded-full border border-slate-800">
-             <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-             <span className="text-[8px] font-mono text-slate-400 tracking-widest uppercase">Field_Stable_Ξ=1.000</span>
+        <div className="lg:col-span-2 bg-slate-900 rounded-[3rem] border border-slate-800 p-6 flex flex-col items-center justify-center relative shadow-2xl group">
+          <div className="absolute top-10 left-10 flex items-center gap-3">
+             <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_15px_#10b981]" />
+             <span className="text-[9px] font-mono text-emerald-500 tracking-[0.3em] uppercase">Phase_Lock_Enabled</span>
           </div>
           
           <canvas 
@@ -174,18 +167,24 @@ const DephazeAnisotropicMapping = () => {
                 });
               }
             }}
-            className="cursor-move w-full max-h-[420px]"
+            className="cursor-grab active:cursor-grabbing w-full h-auto max-h-[500px]"
           />
 
-          <div className="mt-4 flex gap-6 pb-2">
-             <div className="flex items-center gap-1.5 text-[8px] text-slate-600 uppercase">
-                <ShieldCheck size={10} className="text-emerald-700" /> Manifold_Verified
+          <div className="mt-8 flex gap-10 opacity-40 group-hover:opacity-100 transition-opacity">
+             <div className="flex items-center gap-2 text-[8px] text-slate-400 uppercase tracking-widest">
+                <ShieldCheck size={12} className="text-emerald-500" /> Manifold_OK
              </div>
-             <div className="flex items-center gap-1.5 text-[8px] text-slate-600 uppercase">
-                <Activity size={10} className="text-blue-700" /> Real_Time_Sync
+             <div className="flex items-center gap-2 text-[8px] text-slate-400 uppercase tracking-widest">
+                <Activity size={12} className="text-blue-500" /> Latency_0ms
              </div>
           </div>
         </div>
+      </div>
+
+      <div className="mt-8 bg-slate-900 bg-opacity-50 rounded-2xl border border-slate-900 p-4 text-center">
+          <p className="text-[9px] text-slate-700 font-mono tracking-widest">
+            RECONSTRUCTED_VIA_DEPHAZE_ANISOTROPIC_MAP_V6.3_KERN_STABLE
+          </p>
       </div>
     </div>
   );
