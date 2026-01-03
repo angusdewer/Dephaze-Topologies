@@ -49,7 +49,7 @@ The included interactive viewer proves that the computational overhead of the DE
 
 ---
 
-## 🚀 Implementation
+##  Implementation
 
 The kernel is designed for low-level integration (C++, GLSL, Python, JS). 
 
@@ -63,7 +63,7 @@ def dephaze_kernel(x, y, z, R, n):
     # Stability coefficient (Xi)
     # The system seeks equilibrium where Xi = 1
     return R / pattern
-
+##
  Live Interactive Demo
 Witness the topological shift in real-time: https://dephaze-topologies.vercel.app/
  Intellectual Property & Science
