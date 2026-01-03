@@ -1,4 +1,4 @@
-# 🌀 DEPHAZE Protocol (v6.3)
+#  DEPHAZE Protocol (v6.3)
 ### The Obsolescence of Polygons. The Emergence of Implicit Topology.
 
 [![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen?style=for-the-badge)](https://dephaze-topologies.vercel.app/)
@@ -8,7 +8,7 @@
 
 Stop polluting the digital world with bloated polygon meshes, multi-gigabyte STL files, and faceted edges. DEPHAZE redefines spatial existence not as a list of coordinates, but as a **Unified Stability Condition.**
 
-## ⚡ The Holy Grail: Universal Master Formula
+##  Universal Master Formula
 
 Every convex primitive—from spheres to cubes and all hybrid topologies in between—is condensed into a single generative seed. No vertices. No indices. Only pure mathematics.
 
@@ -24,7 +24,7 @@ Where $\Xi = 1$ represents the **Event Horizon**, the absolute boundary of manif
 
 ---
 
-## 🛠 Technological Ecosystem
+##  Technological Ecosystem
 
 ### 1. Mathematical Validation (Lp-Norm Transition)
 The system numerically proves continuous metamorphosis between classical geometries by simply adjusting the topological order:
@@ -37,7 +37,7 @@ The included interactive viewer proves that the computational overhead of the DE
 
 ---
 
-## 📈 Comparison: The Old World vs. DEPHAZE
+##  Comparison: The Old World vs. DEPHAZE
 
 | Feature | Legacy Mesh (STL / OBJ) | DEPHAZE Protocol |
 | :--- | :--- | :--- |
@@ -63,3 +63,9 @@ def dephaze_kernel(x, y, z, R, n):
     # Stability coefficient (Xi)
     # The system seeks equilibrium where Xi = 1
     return R / pattern
+ Live Interactive Demo
+Witness the topological shift in real-time: https://dephaze-topologies.vercel.app/
+ Intellectual Property & Science
+The DEPHAZE Protocol is archived via Zenodo with a registered DOI. Any industrial implementation (BAMBU LAB, AUTODESK, etc.) is subject to the licensing terms of the protocol.
+Geometry is no longer about drawing points. Geometry is about tuning stability frequencies.
+© 2026 DEPHAZE MANUFACTURE / Lead Developer
