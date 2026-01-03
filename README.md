@@ -1,6 +1,4 @@
-This updated **README.md** carefully integrates the hardware-level implications, focusing on how the protocol bypasses current CPU/GPU bottlenecks and enables a "Firmware-Only" revolution for existing machines like 3D printers.
 
-```markdown
 # 🌀 DEPHAZE Protocol (v6.3)
 ### The Obsolescence of Polygons. The Emergence of Implicit Topology.
 
