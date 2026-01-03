@@ -67,13 +67,13 @@ def dephaze_kernel(x, y, z, R, n):
 ### 🔗 Live Interactive Demo
 Witness the topological shift in real-time: [https://dephaze-topologies.vercel.app/](https://dephaze-topologies.vercel.app/)
 
----
+
 
 ##  Intellectual Property & Science
 The DEPHAZE Protocol is archived via **Zenodo** with a registered DOI. Any industrial implementation (BAMBU LAB, AUTODESK, etc.) is subject to the licensing terms of the protocol. 
 
 **Geometry is no longer about drawing points. Geometry is about tuning stability frequencies.**
 
----
+
 © 2026 DEPHAZE MANUFACTURE / Lead Developer
-```
+
