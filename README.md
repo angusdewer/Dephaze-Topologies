@@ -63,6 +63,7 @@ def dephaze_kernel(x, y, z, R, n):
     # Stability coefficient (Xi)
     # The system seeks equilibrium where Xi = 1
     return R / pattern
+
  Live Interactive Demo
 Witness the topological shift in real-time: https://dephaze-topologies.vercel.app/
  Intellectual Property & Science
