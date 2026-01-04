@@ -1,270 +1,359 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { Scan, Zap, Cpu, Target, Database, Activity, Loader2 } from 'lucide-react';
+import { Scan, Zap, Cpu, Target, Database, Atom } from 'lucide-react';
 
-const DephazeSpectralMap = () => {
+const DephazePhaseMap = () => {
   const canvasRef = useRef(null);
   const [rotation, setRotation] = useState({ x: 0.8, y: 0.5 });
-  const [spectralPower, setSpectralPower] = useState(6); 
-  const [scanDensity, setScanDensity] = useState(800);
-  const [meshType, setMeshType] = useState('organic');
+  const [phaseResolution, setPhaseResolution] = useState(32);
+  const [scanDensity, setScanDensity] = useState(500);
+  const [meshType, setMeshType] = useState('bumpy');
   const [viewMode, setViewMode] = useState('dephaze');
 
-  // === 1. SZKENNELT NYERS ADAT (ϕ⁻³) ===
+  // === 1. SZKENNELÉS ===
   const scannedPoints = useMemo(() => {
     const points = [];
+    
     for (let i = 0; i < scanDensity; i++) {
       const theta = Math.random() * 2 * Math.PI;
       const phi = Math.random() * Math.PI;
+      
       let R = 2.0;
       
-      if (meshType === 'organic') {
-        R += 0.4 * Math.sin(theta * 2) * Math.cos(phi * 3) + 0.2 * Math.cos(theta * 5);
+      if (meshType === 'bumpy') {
+        R += 0.35 * Math.sin(theta * 3) * Math.cos(phi * 2);
+        R += 0.25 * Math.sin(theta * 5 + phi * 3);
       } else if (meshType === 'spike') {
-        R += 0.7 * Math.pow(Math.abs(Math.sin(theta * 3) * Math.cos(phi * 3)), 2);
+        R += 0.6 * Math.abs(Math.sin(theta * 2)) * Math.abs(Math.cos(phi * 2));
       } else {
-        R += 0.3 * Math.sin(theta * 4) * Math.sin(phi * 2);
+        R += 0.3 * Math.sin(theta * 2.3 + phi * 1.7);
+        R += 0.15 * Math.cos(theta * 4.1) * Math.sin(phi * 3.3);
       }
       
-      points.push({ 
-        x: R * Math.sin(phi) * Math.cos(theta), 
-        y: R * Math.sin(phi) * Math.sin(theta), 
-        z: R * Math.cos(phi), 
-        theta, phi, R 
-      });
+      const x = R * Math.sin(phi) * Math.cos(theta);
+      const y = R * Math.sin(phi) * Math.sin(theta);
+      const z = R * Math.cos(phi);
+      
+      points.push({ x, y, z, theta, phi, R });
     }
+    
     return points;
   }, [meshType, scanDensity]);
 
-  // === 2. SPEKTRÁLIS FÁZIS-SŰRÍTÉS ===
-  const spectralCoefficients = useMemo(() => {
-    const coeffs = [];
-    const sampleSet = scannedPoints.length > 500 ? scannedPoints.filter((_, i) => i % 5 === 0) : scannedPoints;
+  // === 2. FÁZISTÉRKÉP ===
+  const phaseMap = useMemo(() => {
+    const map = Array(phaseResolution).fill(null).map(() => 
+      Array(phaseResolution).fill(null).map(() => ({ R: 2.0, count: 0 }))
+    );
     
-    for (let m = 0; m < spectralPower; m++) {
-      for (let l = 0; l < spectralPower; l++) {
-        let weight = 0;
-        sampleSet.forEach(p => {
-          weight += p.R * Math.cos(m * p.theta) * Math.sin(l * p.phi);
-        });
-        coeffs.push(weight / (sampleSet.length || 1));
-      }
-    }
-    return coeffs;
-  }, [scannedPoints, spectralPower]);
-
-  // === 3. REKONSTRUKCIÓ ===
-  const resolveFieldR = (theta, phi) => {
-    let R = 2.0;
-    let idx = 0;
-    for (let m = 0; m < spectralPower; m++) {
-      for (let l = 0; l < spectralPower; l++) {
-        if (spectralCoefficients[idx]) {
-          R += spectralCoefficients[idx] * Math.cos(m * theta) * Math.sin(l * phi);
+    scannedPoints.forEach(p => {
+      const thetaIdx = Math.floor((p.theta / (2 * Math.PI)) * phaseResolution) % phaseResolution;
+      const phiIdx = Math.floor((p.phi / Math.PI) * phaseResolution);
+      
+      if (phiIdx >= 0 && phiIdx < phaseResolution) {
+        if (map[thetaIdx][phiIdx].count === 0) {
+          map[thetaIdx][phiIdx].R = p.R;
+        } else {
+          map[thetaIdx][phiIdx].R = (map[thetaIdx][phiIdx].R * map[thetaIdx][phiIdx].count + p.R) / (map[thetaIdx][phiIdx].count + 1);
         }
-        idx++;
+        map[thetaIdx][phiIdx].count += 1;
+      }
+    });
+    
+    // Gyors interpoláció üres cellákra
+    for (let i = 0; i < phaseResolution; i++) {
+      for (let j = 0; j < phaseResolution; j++) {
+        if (map[i][j].count === 0) {
+          const i1 = (i - 1 + phaseResolution) % phaseResolution;
+          const i2 = (i + 1) % phaseResolution;
+          const j1 = Math.max(0, j - 1);
+          const j2 = Math.min(phaseResolution - 1, j + 1);
+          
+          let sum = 0;
+          let cnt = 0;
+          if (map[i1][j].count > 0) { sum += map[i1][j].R; cnt++; }
+          if (map[i2][j].count > 0) { sum += map[i2][j].R; cnt++; }
+          if (map[i][j1].count > 0) { sum += map[i][j1].R; cnt++; }
+          if (map[i][j2].count > 0) { sum += map[i][j2].R; cnt++; }
+          
+          map[i][j].R = cnt > 0 ? sum / cnt : 2.0;
+        }
       }
     }
-    return R;
+    
+    return map;
+  }, [scannedPoints, phaseResolution]);
+
+  // === 3. GYORS REKONSTRUKCIÓ ===
+  const reconstructR = (theta, phi) => {
+    const ti = Math.floor((theta / (2 * Math.PI)) * phaseResolution) % phaseResolution;
+    const tj = Math.floor((phi / Math.PI) * phaseResolution);
+    
+    if (tj < 0 || tj >= phaseResolution) return 2.0;
+    
+    return phaseMap[ti][tj].R;
   };
 
   // === 4. METRIKÁK ===
   const metrics = useMemo(() => {
     const meshSize = scanDensity * 12;
-    const dephazeSize = 16 + (spectralCoefficients.length * 2);
+    const dephazeSize = 16 + (phaseResolution * phaseResolution * 4);
+    
+    let errorSum = 0;
+    scannedPoints.forEach(p => {
+      const reconstructed = reconstructR(p.theta, p.phi);
+      errorSum += Math.abs(reconstructed - p.R);
+    });
+    
+    const avgError = errorSum / scannedPoints.length;
+    const xiStability = Math.max(0, 100 - (avgError * 50));
+    
     return {
-      meshSize: (meshSize / 1024).toFixed(2),
+      meshSize,
       dephazeSize,
-      ratio: (meshSize / dephazeSize).toFixed(0),
+      ratio: (meshSize / dephazeSize).toFixed(1),
+      xiStability: xiStability.toFixed(1),
+      avgError: (avgError * 100).toFixed(2)
     };
-  }, [scanDensity, spectralCoefficients]);
+  }, [scannedPoints, phaseMap, phaseResolution, scanDensity]);
 
-  // === 5. RENDERER ENGINE ===
+  // === 5. RENDERER ===
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    
-    let animationId;
-    const render = () => {
-      const w = canvas.width = 700;
-      const h = canvas.height = 500;
-      ctx.fillStyle = '#020617';
-      ctx.fillRect(0, 0, w, h);
-      
-      const centerX = w / 2;
-      const centerY = h / 2;
-      const scale = 110;
-      let renderPoints = [];
+    const width = canvas.width = 600;
+    const height = canvas.height = 600;
 
-      // DEPHAZE FIELD
-      if (viewMode !== 'mesh') {
-        const res = 30;
-        for (let i = 0; i < res; i++) {
-          const theta = (i / res) * Math.PI * 2;
-          for (let j = 0; j < res; j++) {
-            const phi = (j / res) * Math.PI;
-            const R = resolveFieldR(theta, phi);
-            const x = R * Math.sin(phi) * Math.cos(theta);
-            const y = R * Math.sin(phi) * Math.sin(theta);
-            const z = R * Math.cos(phi);
+    ctx.clearRect(0, 0, width, height);
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const scale = 90;
+    const points = [];
 
-            const y1 = y * Math.cos(rotation.x) - z * Math.sin(rotation.x);
-            const z1 = y * Math.sin(rotation.x) + z * Math.cos(rotation.x);
-            const x2 = x * Math.cos(rotation.y) + z1 * Math.sin(rotation.y);
-            const z2 = -x * Math.sin(rotation.y) + z1 * Math.cos(rotation.y);
-            renderPoints.push({ x: x2, y: y1, z: z2, type: 'dephaze' });
-          }
+    // DEPHAZE
+    if (viewMode !== 'mesh') {
+      const res = 35;
+      for (let i = 0; i <= res; i++) {
+        const theta = (i / res) * Math.PI * 2;
+        for (let j = 0; j <= res; j++) {
+          const phi = (j / res) * Math.PI;
+          const R = reconstructR(theta, phi);
+          
+          const x = R * Math.sin(phi) * Math.cos(theta);
+          const y = R * Math.sin(phi) * Math.sin(theta);
+          const z = R * Math.cos(phi);
+
+          const cosX = Math.cos(rotation.x);
+          const sinX = Math.sin(rotation.x);
+          const y1 = y * cosX - z * sinX;
+          const z1 = y * sinX + z * cosX;
+
+          const cosY = Math.cos(rotation.y);
+          const sinY = Math.sin(rotation.y);
+          const x2 = x * cosY + z1 * sinY;
+          const z2 = -x * sinY + z1 * cosY;
+
+          points.push({ x: x2, y: y1, z: z2, type: 'dephaze' });
         }
       }
+    }
 
-      // MESH CLOUD
-      if (viewMode !== 'dephaze') {
-        scannedPoints.slice(0, 400).forEach(p => {
-          const y1 = p.y * Math.cos(rotation.x) - p.z * Math.sin(rotation.x);
-          const z1 = p.y * Math.sin(rotation.x) + p.z * Math.cos(rotation.x);
-          const x2 = p.x * Math.cos(rotation.y) + z1 * Math.sin(rotation.y);
-          const z2 = -p.x * Math.sin(rotation.y) + z1 * Math.cos(rotation.y);
-          renderPoints.push({ x: x2, y: y1, z: z2, type: 'mesh' });
-        });
-      }
+    // MESH
+    if (viewMode !== 'dephaze') {
+      scannedPoints.slice(0, 200).forEach(p => {
+        const cosX = Math.cos(rotation.x);
+        const sinX = Math.sin(rotation.x);
+        const y1 = p.y * cosX - p.z * sinX;
+        const z1 = p.y * sinX + p.z * cosX;
 
-      renderPoints.sort((a, b) => a.z - b.z);
-      renderPoints.forEach(p => {
-        const depth = (p.z + 3) / 6;
-        ctx.beginPath();
-        ctx.fillStyle = p.type === 'mesh' ? `rgba(239, 68, 68, ${0.4 + depth * 0.4})` : `rgba(59, 130, 246, ${0.3 + depth * 0.5})`;
-        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, (p.type === 'mesh' ? 3 : 1.5) * depth, 0, Math.PI * 2);
-        ctx.fill();
+        const cosY = Math.cos(rotation.y);
+        const sinY = Math.sin(rotation.y);
+        const x2 = p.x * cosY + z1 * sinY;
+        const z2 = -p.x * sinY + z1 * cosY;
+
+        points.push({ x: x2, y: y1, z: z2, type: 'mesh' });
       });
-    };
+    }
 
-    render();
-  }, [rotation, spectralCoefficients, viewMode, scannedPoints, spectralPower]);
+    points.sort((a, b) => a.z - b.z);
+    
+    points.forEach(p => {
+      const depth = (p.z + 3) / 6;
+      
+      if (p.type === 'mesh') {
+        ctx.fillStyle = `rgba(255, 60, 60, ${0.6 + depth * 0.3})`;
+        ctx.beginPath();
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 2 + depth * 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const b = Math.floor(depth * 200) + 55;
+        ctx.fillStyle = `rgba(${b/5}, ${b/1.8}, ${b}, ${0.3 + depth * 0.5})`;
+        ctx.beginPath();
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 1 + depth * 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+  }, [rotation, scannedPoints, phaseMap, viewMode]);
 
   return (
-    <div className="p-4 md:p-8 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-sans">
-      
-      {/* HEADER SECTION */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-10 border-b border-slate-800 pb-8 gap-4">
-        <div>
-          <h1 className="text-4xl md:text-6xl font-black tracking-tighter bg-gradient-to-r from-blue-400 to-indigo-600 bg-clip-text text-transparent">
-            DEPHAZE SPECTRUM
-          </h1>
-          <p className="text-slate-500 font-mono text-base mt-2 tracking-widest uppercase">Phase-Mapping Engine v6.3</p>
-        </div>
-        <div className="text-left md:text-right bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-          <p className="text-xs text-blue-400 font-bold uppercase mb-1">Reality Condition</p>
-          <p className="text-xl md:text-2xl font-mono text-white">Ω₀ ⊗ Ψ = 1</p>
-        </div>
+    <div className="p-6 max-w-6xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
+      <div className="text-center mb-6">
+        <h1 className="text-3xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase">
+          DEPHAZE Phase Map
+        </h1>
+        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-2">
+          Ω₀ // ϕ³↔ϕ⁻³ // Ξ=1
+        </p>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
-        
-        {/* METRICS COLUMN */}
-        <div className="space-y-6">
-          <div className="bg-slate-900 p-6 rounded-2xl border-l-4 border-red-500 shadow-xl">
-            <h3 className="text-red-500 font-black text-sm uppercase mb-4 flex items-center gap-2">
-              <Database size={20} /> Legacy Mesh
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="space-y-3">
+          <div className="bg-purple-950 p-4 rounded-xl border border-purple-600 border-opacity-30">
+            <h3 className="text-purple-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
+              <Atom size={12} /> Axiómák
             </h3>
-            <div className="space-y-1">
-              <p className="text-4xl font-black">{metrics.meshSize} <span className="text-lg">KB</span></p>
-              <p className="text-slate-500 text-xs">RAW COORDINATES</p>
+            <div className="text-[8px] text-purple-200 space-y-1 leading-relaxed">
+              <p>Ω₀: Zeropoint</p>
+              <p>ϕ³: Generatív</p>
+              <p>ϕ⁻³: Megfigyelt</p>
+              <p>Ξ=ϕ³/ϕ⁻³=1</p>
             </div>
           </div>
 
-          <div className="bg-slate-900 p-6 rounded-2xl border-l-4 border-blue-500 shadow-xl">
-            <h3 className="text-blue-400 font-black text-sm uppercase mb-4 flex items-center gap-2">
-              <Zap size={20} /> DEPHAZE Kernel
+          <div className="bg-slate-900 p-4 rounded-xl border border-red-500 border-opacity-30">
+            <h3 className="text-red-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
+              <Database size={12} /> MESH
             </h3>
-            <div className="space-y-1">
-              <p className="text-4xl font-black text-blue-400">{metrics.dephazeSize} <span className="text-lg text-white">B</span></p>
-              <p className="text-slate-500 text-xs">PHASE-HARMONIC SEED</p>
+            <div className="bg-black p-3 rounded-lg mb-2">
+              <p className="text-[7px] text-slate-500 uppercase">Méret</p>
+              <p className="text-xl font-black text-red-500">{(metrics.meshSize/1024).toFixed(1)}KB</p>
+            </div>
+            <div className="bg-black p-3 rounded-lg">
+              <p className="text-[7px] text-slate-500 uppercase">Pontok</p>
+              <p className="text-lg font-bold text-white">{scanDensity}</p>
             </div>
           </div>
 
-          <div className="bg-blue-600 p-8 rounded-2xl shadow-2xl shadow-blue-500/20 text-center transform hover:scale-105 transition-transform">
-            <p className="text-6xl font-black leading-none">{metrics.ratio}×</p>
-            <p className="text-sm font-bold mt-2 uppercase tracking-widest">Compression Ratio</p>
+          <div className="bg-slate-900 p-4 rounded-xl border border-blue-500 border-opacity-30">
+            <h3 className="text-blue-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
+              <Zap size={12} /> DEPHAZE
+            </h3>
+            <div className="bg-black p-3 rounded-lg mb-2">
+              <p className="text-[7px] text-slate-500 uppercase">Méret</p>
+              <p className="text-xl font-black text-blue-500">{(metrics.dephazeSize/1024).toFixed(1)}KB</p>
+            </div>
+            <div className="bg-black p-3 rounded-lg">
+              <p className="text-[7px] text-slate-500 uppercase">Térkép</p>
+              <p className="text-lg font-bold text-white">{phaseResolution}²</p>
+            </div>
+          </div>
+
+          <div className="bg-emerald-950 p-4 rounded-xl border border-emerald-600 border-opacity-40">
+            <h3 className="text-emerald-400 font-bold text-[10px] mb-2 uppercase flex items-center gap-2">
+              <Target size={12} /> Ξ Stabilitás
+            </h3>
+            <div className="text-center mb-2">
+              <p className="text-3xl font-black text-white">{metrics.xiStability}%</p>
+            </div>
+            <div className="text-center pt-2 border-t border-emerald-800">
+              <p className="text-2xl font-black text-white">{metrics.ratio}×</p>
+              <p className="text-[7px] text-slate-400 uppercase">Kompresszió</p>
+            </div>
           </div>
         </div>
 
-        {/* VISUALIZER COLUMN */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="bg-black rounded-3xl border border-slate-800 p-2 relative shadow-2xl">
-            <div className="absolute top-6 left-6 z-10 space-y-2">
-               <div className="flex items-center gap-2 bg-black/60 backdrop-blur px-3 py-1 rounded-full border border-red-500/30 text-[10px] font-bold text-red-400 uppercase">
-                  <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" /> ϕ⁻³ MANIFEST
-               </div>
-               <div className="flex items-center gap-2 bg-black/60 backdrop-blur px-3 py-1 rounded-full border border-blue-500/30 text-[10px] font-bold text-blue-400 uppercase">
-                  <div className="w-2 h-2 bg-blue-500 rounded-full" /> ϕ³ GENERATIVE
-               </div>
+        <div className="lg:col-span-2 space-y-3">
+          <div className="bg-slate-900 rounded-2xl border border-slate-800 p-4 relative">
+            <div className="absolute top-4 left-4 space-y-1 z-10">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-red-500 rounded-full" />
+                <span className="text-[8px] text-red-400 uppercase">ϕ⁻³ Szkennelt</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-blue-500 rounded-full" />
+                <span className="text-[8px] text-blue-400 uppercase">ϕ³ Fázistérkép</span>
+              </div>
             </div>
 
+            <div className="absolute top-4 right-4 flex gap-1 z-10">
+              <button 
+                onClick={() => setViewMode('mesh')}
+                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'mesh' ? 'bg-red-600' : 'bg-slate-800'}`}
+              >
+                ϕ⁻³
+              </button>
+              <button 
+                onClick={() => setViewMode('dephaze')}
+                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'dephaze' ? 'bg-blue-600' : 'bg-slate-800'}`}
+              >
+                ϕ³
+              </button>
+              <button 
+                onClick={() => setViewMode('both')}
+                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'both' ? 'bg-purple-600' : 'bg-slate-800'}`}
+              >
+                BOTH
+              </button>
+            </div>
+            
             <canvas 
-              ref={canvasRef} 
-              className="w-full h-[500px] cursor-grab active:cursor-grabbing"
+              ref={canvasRef}
               onMouseMove={(e) => {
                 if(e.buttons === 1) {
                   setRotation({
-                    x: rotation.x + e.movementY * 0.01,
-                    y: rotation.y + e.movementX * 0.01
+                    x: rotation.x + e.movementY * 0.007,
+                    y: rotation.y + e.movementX * 0.007
                   });
                 }
               }}
+              className="cursor-grab active:cursor-grabbing w-full"
             />
-
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-2 bg-slate-900/80 p-2 rounded-full border border-slate-700 backdrop-blur">
-              {['mesh', 'dephaze', 'both'].map(m => (
-                <button 
-                  key={m} 
-                  onClick={() => setViewMode(m)} 
-                  className={`px-6 py-2 rounded-full text-[10px] font-black uppercase transition-all ${viewMode === m ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-white'}`}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* CONTROLS COLUMN */}
-        <div className="space-y-6">
-          <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
-            <h3 className="text-blue-400 font-bold text-xs uppercase mb-6 flex items-center gap-2">
-              <Cpu size={18} /> Spectral Density
-            </h3>
-            <input 
-              type="range" min="4" max="12" step="1"
-              value={spectralPower} 
-              onChange={(e) => setSpectralPower(parseInt(e.target.value))} 
-              className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500" 
-            />
-            <div className="flex justify-between text-[10px] text-slate-500 mt-4 font-bold">
-              <span>MAX COMPRESS</span>
-              <span>MAX DETAIL</span>
-            </div>
-            <p className="text-center mt-4 font-mono text-2xl text-blue-400">{spectralPower}² Coeffs</p>
           </div>
 
-          <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
-            <h3 className="text-purple-400 font-bold text-xs uppercase mb-4 flex items-center gap-2">
-              <Target size={18} /> Topology Type
-            </h3>
-            <div className="grid grid-cols-1 gap-2">
-              {['organic', 'spike', 'minimal'].map(t => (
-                <button 
-                  key={t} 
-                  onClick={() => setMeshType(t)} 
-                  className={`py-4 rounded-xl text-xs font-black uppercase transition-all ${meshType === t ? 'bg-purple-600 border-purple-400 text-white' : 'bg-slate-800 text-slate-500 border-transparent hover:border-slate-600'}`}
-                >
-                  {t}
-                </button>
-              ))}
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-slate-900 p-3 rounded-xl">
+              <h3 className="text-purple-400 text-[9px] mb-2 uppercase flex items-center gap-1">
+                <Cpu size={10} /> Fázis Felbontás
+              </h3>
+              <input 
+                type="range" min="16" max="64" step="8" value={phaseResolution}
+                onChange={(e) => setPhaseResolution(parseInt(e.target.value))}
+                className="w-full h-1 bg-slate-800 rounded-lg accent-purple-500 mb-2"
+              />
+              <p className="text-center text-xl font-bold text-white">{phaseResolution}×{phaseResolution}</p>
+            </div>
+
+            <div className="bg-slate-900 p-3 rounded-xl">
+              <h3 className="text-cyan-400 text-[9px] mb-2 uppercase flex items-center gap-1">
+                <Scan size={10} /> Szkennelés
+              </h3>
+              <input 
+                type="range" min="200" max="2000" step="200" value={scanDensity}
+                onChange={(e) => setScanDensity(parseInt(e.target.value))}
+                className="w-full h-1 bg-slate-800 rounded-lg accent-cyan-500 mb-2"
+              />
+              <p className="text-center text-xl font-bold text-white">{scanDensity}</p>
             </div>
           </div>
 
-          <div className="bg-indigo-950/20 p-6 rounded-2xl border border-indigo-500/20 text-sm leading-relaxed italic text-indigo-300">
-            "Az amorf testeknél a 0 pontból induló fázis-vektorok adják a topológiai ujjlenyomatot. Ez a spektrális seed 1000x hatékonyabb, mint a nyers koordináta-adat."
+          <div className="flex gap-2">
+            <button 
+              onClick={() => setMeshType('bumpy')}
+              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'bumpy' ? 'bg-purple-600' : 'bg-slate-800'}`}
+            >
+              BUMPY
+            </button>
+            <button 
+              onClick={() => setMeshType('spike')}
+              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'spike' ? 'bg-purple-600' : 'bg-slate-800'}`}
+            >
+              SPIKE
+            </button>
+            <button 
+              onClick={() => setMeshType('organic')}
+              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'organic' ? 'bg-purple-600' : 'bg-slate-800'}`}
+            >
+              ORGANIC
+            </button>
           </div>
         </div>
       </div>
@@ -272,4 +361,4 @@ const DephazeSpectralMap = () => {
   );
 };
 
-export default DephazeSpectralMap;
+export default DephazePhaseMap;
