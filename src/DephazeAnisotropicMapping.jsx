@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { Scan, Zap, Cpu, Target, Database, Atom } from 'lucide-react';
+import { Scan, Zap, Cpu, Target, Database, Atom, Waves } from 'lucide-react';
 
 const DephazePhaseMap = () => {
   const canvasRef = useRef(null);
@@ -7,9 +7,11 @@ const DephazePhaseMap = () => {
   const [phaseResolution, setPhaseResolution] = useState(32);
   const [scanDensity, setScanDensity] = useState(500);
   const [meshType, setMeshType] = useState('bumpy');
-  const [viewMode, setViewMode] = useState('dephaze');
+  const [viewMode, setViewMode] = useState('both');
+  const [compressionMode, setCompressionMode] = useState('spatial'); // 'spatial' or 'fourier'
+  const [fourierTopK, setFourierTopK] = useState(20);
 
-  // === 1. SZKENNELÉS ===
+  // === 1. SCANNING (φ⁻³ Observable Pattern) ===
   const scannedPoints = useMemo(() => {
     const points = [];
     
@@ -39,7 +41,7 @@ const DephazePhaseMap = () => {
     return points;
   }, [meshType, scanDensity]);
 
-  // === 2. FÁZISTÉRKÉP ===
+  // === 2. PHASE MAP CONSTRUCTION (Spatial Domain) ===
   const phaseMap = useMemo(() => {
     const map = Array(phaseResolution).fill(null).map(() => 
       Array(phaseResolution).fill(null).map(() => ({ R: 2.0, count: 0 }))
@@ -59,7 +61,7 @@ const DephazePhaseMap = () => {
       }
     });
     
-    // Gyors interpoláció üres cellákra
+    // Interpolate empty cells
     for (let i = 0; i < phaseResolution; i++) {
       for (let j = 0; j < phaseResolution; j++) {
         if (map[i][j].count === 0) {
@@ -83,20 +85,117 @@ const DephazePhaseMap = () => {
     return map;
   }, [scannedPoints, phaseResolution]);
 
-  // === 3. GYORS REKONSTRUKCIÓ ===
+  // === 3. FOURIER COMPRESSION (Frequency Domain) ===
+  const fourierData = useMemo(() => {
+    if (compressionMode !== 'fourier') return null;
+
+    const matrix = phaseMap.map(row => row.map(cell => cell.R));
+    const N = phaseResolution;
+    
+    // Calculate DC component (average)
+    let dcSum = 0;
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) {
+        dcSum += matrix[i][j];
+      }
+    }
+    const dc = dcSum / (N * N);
+    
+    // Calculate ALL Fourier coefficients with FULL spectrum
+    const allCoeffs = [];
+    
+    // CRITICAL: Sample ENTIRE frequency space for accurate reconstruction
+    const maxFreqX = Math.floor(N / 2);
+    const maxFreqY = Math.floor(N / 2);
+    
+    for (let kx = -maxFreqX; kx <= maxFreqX; kx++) {
+      for (let ky = -maxFreqY; ky <= maxFreqY; ky++) {
+        if (kx === 0 && ky === 0) continue; // Skip DC
+        
+        let real = 0;
+        let imag = 0;
+        
+        for (let i = 0; i < N; i++) {
+          for (let j = 0; j < N; j++) {
+            const angle = -2 * Math.PI * (kx * i / N + ky * j / N);
+            const val = matrix[i][j] - dc;
+            real += val * Math.cos(angle);
+            imag += val * Math.sin(angle);
+          }
+        }
+        
+        const amplitude = Math.sqrt(real * real + imag * imag);
+        
+        // Keep ALL non-zero coefficients for selection
+        if (amplitude > 0.0001) {
+          allCoeffs.push({
+            kx, ky,
+            real: real / (N * N),
+            imag: imag / (N * N),
+            amplitude: amplitude / (N * N)
+          });
+        }
+      }
+    }
+    
+    // Sort by amplitude (KEEP BOTH positive and negative frequencies!)
+    allCoeffs.sort((a, b) => b.amplitude - a.amplitude);
+    
+    // Select top K (but ensure we capture all important features)
+    const topCoeffs = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
+    
+    return {
+      coefficients: topCoeffs,
+      dc: dc,
+      N: phaseResolution,
+      totalCoeffs: allCoeffs.length
+    };
+  }, [phaseMap, phaseResolution, compressionMode, fourierTopK]);
+
+  // === 4. RECONSTRUCTION ===
   const reconstructR = (theta, phi) => {
-    const ti = Math.floor((theta / (2 * Math.PI)) * phaseResolution) % phaseResolution;
-    const tj = Math.floor((phi / Math.PI) * phaseResolution);
-    
-    if (tj < 0 || tj >= phaseResolution) return 2.0;
-    
-    return phaseMap[ti][tj].R;
+    if (compressionMode === 'fourier' && fourierData) {
+      // HIGH-FIDELITY Fourier reconstruction
+      const N = fourierData.N;
+      
+      // Continuous coordinates (not discretized)
+      const ti = (theta / (2 * Math.PI)) * N;
+      const tj = (phi / Math.PI) * N;
+      
+      // Start with DC (average value)
+      let R = fourierData.dc;
+      
+      // Add ALL selected frequency components
+      fourierData.coefficients.forEach(coeff => {
+        const angle = 2 * Math.PI * (coeff.kx * ti / N + coeff.ky * tj / N);
+        const contribution = coeff.real * Math.cos(angle) - coeff.imag * Math.sin(angle);
+        R += contribution;
+      });
+      
+      // MINIMAL clamping (only prevent extreme outliers)
+      return Math.max(0.5, Math.min(4.0, R));
+    } else {
+      // Spatial domain reconstruction
+      const ti = Math.floor((theta / (2 * Math.PI)) * phaseResolution) % phaseResolution;
+      const tj = Math.floor((phi / Math.PI) * phaseResolution);
+      
+      if (tj < 0 || tj >= phaseResolution) return 2.0;
+      return phaseMap[ti][tj].R;
+    }
   };
 
-  // === 4. METRIKÁK ===
+  // === 5. METRICS (Ξ Stability) ===
   const metrics = useMemo(() => {
     const meshSize = scanDensity * 12;
-    const dephazeSize = 16 + (phaseResolution * phaseResolution * 4);
+    
+    let dephazeSize;
+    if (compressionMode === 'fourier') {
+      // Fourier: K coefficients × 16 bytes (2 floats: real + imag) + metadata
+      dephazeSize = 16 + (fourierTopK * 16) + 8;
+    } else {
+      // Spatial: resolution² × 4 bytes
+      dephazeSize = 16 + (phaseResolution * phaseResolution * 4);
+    }
     
     let errorSum = 0;
     scannedPoints.forEach(p => {
@@ -112,26 +211,35 @@ const DephazePhaseMap = () => {
       dephazeSize,
       ratio: (meshSize / dephazeSize).toFixed(1),
       xiStability: xiStability.toFixed(1),
-      avgError: (avgError * 100).toFixed(2)
+      avgError: (avgError * 100).toFixed(2),
+      compressionVsMesh: (meshSize / dephazeSize).toFixed(0)
     };
-  }, [scannedPoints, phaseMap, phaseResolution, scanDensity]);
+  }, [scannedPoints, phaseMap, phaseResolution, scanDensity, compressionMode, fourierTopK]);
 
-  // === 5. RENDERER ===
+  // === 6. 3D RENDERER ===
   useEffect(() => {
     const canvas = canvasRef.current;
+    if (!canvas) return;
+    
     const ctx = canvas.getContext('2d');
     const width = canvas.width = 600;
     const height = canvas.height = 600;
 
     ctx.clearRect(0, 0, width, height);
+    
+    const gradient = ctx.createRadialGradient(width/2, height/2, 0, width/2, height/2, width/2);
+    gradient.addColorStop(0, '#0f172a');
+    gradient.addColorStop(1, '#020617');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+    
     const centerX = width / 2;
     const centerY = height / 2;
     const scale = 90;
     const points = [];
 
-    // DEPHAZE
     if (viewMode !== 'mesh') {
-      const res = 35;
+      const res = 40;
       for (let i = 0; i <= res; i++) {
         const theta = (i / res) * Math.PI * 2;
         for (let j = 0; j <= res; j++) {
@@ -157,9 +265,8 @@ const DephazePhaseMap = () => {
       }
     }
 
-    // MESH
     if (viewMode !== 'dephaze') {
-      scannedPoints.slice(0, 200).forEach(p => {
+      scannedPoints.slice(0, 250).forEach(p => {
         const cosX = Math.cos(rotation.x);
         const sinX = Math.sin(rotation.x);
         const y1 = p.y * cosX - p.z * sinX;
@@ -177,119 +284,217 @@ const DephazePhaseMap = () => {
     points.sort((a, b) => a.z - b.z);
     
     points.forEach(p => {
-      const depth = (p.z + 3) / 6;
+      const depth = (p.z + 3.5) / 7;
       
       if (p.type === 'mesh') {
-        ctx.fillStyle = `rgba(255, 60, 60, ${0.6 + depth * 0.3})`;
+        ctx.fillStyle = `rgba(255, 60, 60, ${0.5 + depth * 0.4})`;
         ctx.beginPath();
-        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 2 + depth * 2, 0, Math.PI * 2);
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 2.5 + depth * 1.5, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = `rgba(255, 100, 100, ${0.2 + depth * 0.2})`;
+        ctx.beginPath();
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 4 + depth * 2, 0, Math.PI * 2);
         ctx.fill();
       } else {
-        const b = Math.floor(depth * 200) + 55;
-        ctx.fillStyle = `rgba(${b/5}, ${b/1.8}, ${b}, ${0.3 + depth * 0.5})`;
+        const color = compressionMode === 'fourier' 
+          ? { r: 100, g: 255, b: 150 }  // Green for Fourier
+          : { r: 100, g: 150, b: 255 }; // Blue for spatial
+        
+        const brightness = depth;
+        ctx.fillStyle = `rgba(${color.r * brightness}, ${color.g * brightness}, ${color.b}, ${0.4 + depth * 0.5})`;
         ctx.beginPath();
-        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 1 + depth * 1.5, 0, Math.PI * 2);
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 1.5 + depth * 1.2, 0, Math.PI * 2);
         ctx.fill();
       }
     });
-  }, [rotation, scannedPoints, phaseMap, viewMode]);
+  }, [rotation, scannedPoints, phaseMap, viewMode, phaseResolution, compressionMode, fourierData]);
 
   return (
-    <div className="p-6 max-w-6xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
+    <div className="p-6 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
       <div className="text-center mb-6">
-        <h1 className="text-3xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase">
+        <h1 className="text-4xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase tracking-wider">
           DEPHAZE Phase Map
         </h1>
-        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-2">
-          Ω₀ // ϕ³↔ϕ⁻³ // Ξ=1
+        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">
+          AMORPHOUS GEOMETRY + FOURIER COMPRESSION
+        </p>
+        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">
+          Ω₀ → φ³ ↔ φ⁻³ → Ξ=1
         </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="space-y-3">
-          <div className="bg-purple-950 p-4 rounded-xl border border-purple-600 border-opacity-30">
-            <h3 className="text-purple-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
-              <Atom size={12} /> Axiómák
+          <div className="bg-purple-950 bg-opacity-50 p-4 rounded-xl border border-purple-600 border-opacity-40">
+            <h3 className="text-purple-400 font-bold text-xs mb-3 uppercase flex items-center gap-2">
+              <Atom size={14} /> DEPHAZE Axioms
             </h3>
-            <div className="text-[8px] text-purple-200 space-y-1 leading-relaxed">
-              <p>Ω₀: Zeropoint</p>
-              <p>ϕ³: Generatív</p>
-              <p>ϕ⁻³: Megfigyelt</p>
-              <p>Ξ=ϕ³/ϕ⁻³=1</p>
+            <div className="text-[9px] text-purple-200 space-y-1.5 leading-relaxed">
+              <p><span className="text-purple-400">Ω₀:</span> Invariant zero-point</p>
+              <p><span className="text-purple-400">φ³:</span> Generative field</p>
+              <p><span className="text-purple-400">φ⁻³:</span> Measured pattern</p>
+              <p><span className="text-purple-400">Ξ:</span> φ³/φ⁻³ = 1</p>
             </div>
           </div>
 
-          <div className="bg-slate-900 p-4 rounded-xl border border-red-500 border-opacity-30">
-            <h3 className="text-red-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
-              <Database size={12} /> MESH
+          <div className="bg-slate-900 p-4 rounded-xl border border-red-500 border-opacity-40">
+            <h3 className="text-red-400 font-bold text-xs mb-3 uppercase flex items-center gap-2">
+              <Database size={14} /> MESH (φ⁻³)
             </h3>
-            <div className="bg-black p-3 rounded-lg mb-2">
-              <p className="text-[7px] text-slate-500 uppercase">Méret</p>
-              <p className="text-xl font-black text-red-500">{(metrics.meshSize/1024).toFixed(1)}KB</p>
+            <div className="bg-black bg-opacity-50 p-3 rounded-lg mb-2">
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Storage</p>
+              <p className="text-2xl font-black text-red-500">{(metrics.meshSize/1024).toFixed(1)} KB</p>
             </div>
-            <div className="bg-black p-3 rounded-lg">
-              <p className="text-[7px] text-slate-500 uppercase">Pontok</p>
-              <p className="text-lg font-bold text-white">{scanDensity}</p>
+            <div className="bg-black bg-opacity-50 p-3 rounded-lg">
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Points</p>
+              <p className="text-xl font-bold text-white">{scanDensity}</p>
             </div>
           </div>
 
-          <div className="bg-slate-900 p-4 rounded-xl border border-blue-500 border-opacity-30">
-            <h3 className="text-blue-400 font-bold text-[10px] mb-3 uppercase flex items-center gap-2">
-              <Zap size={12} /> DEPHAZE
+          {/* Compression Mode Toggle */}
+          <div className="bg-slate-900 p-4 rounded-xl border border-amber-500 border-opacity-40">
+            <h3 className="text-amber-400 font-bold text-xs mb-3 uppercase flex items-center gap-2">
+              <Waves size={14} /> Compression Mode
             </h3>
-            <div className="bg-black p-3 rounded-lg mb-2">
-              <p className="text-[7px] text-slate-500 uppercase">Méret</p>
-              <p className="text-xl font-black text-blue-500">{(metrics.dephazeSize/1024).toFixed(1)}KB</p>
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              <button 
+                onClick={() => setCompressionMode('spatial')}
+                className={`p-2 rounded-lg text-[9px] font-bold transition ${
+                  compressionMode === 'spatial' 
+                    ? 'bg-blue-600 text-white' 
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                SPATIAL
+                <div className="text-[7px] opacity-70">Phase Map</div>
+              </button>
+              <button 
+                onClick={() => setCompressionMode('fourier')}
+                className={`p-2 rounded-lg text-[9px] font-bold transition ${
+                  compressionMode === 'fourier' 
+                    ? 'bg-green-600 text-white' 
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                FOURIER
+                <div className="text-[7px] opacity-70">FFT</div>
+              </button>
             </div>
-            <div className="bg-black p-3 rounded-lg">
-              <p className="text-[7px] text-slate-500 uppercase">Térkép</p>
-              <p className="text-lg font-bold text-white">{phaseResolution}²</p>
+            
+            {compressionMode === 'fourier' && (
+              <div className="mt-3 pt-3 border-t border-slate-700">
+                <p className="text-[8px] text-slate-400 mb-2 uppercase">Top-K Coefficients</p>
+                <input 
+                  type="range" min="5" max="100" step="5" value={fourierTopK}
+                  onChange={(e) => setFourierTopK(parseInt(e.target.value))}
+                  className="w-full h-1 bg-slate-800 rounded-lg"
+                />
+                <div className="flex justify-between text-[7px] text-slate-500 mt-1 mb-2">
+                  <span>Smooth (5)</span>
+                  <span>Detailed (100)</span>
+                </div>
+                <p className="text-center text-lg font-bold text-green-400">K = {fourierTopK}</p>
+                {fourierData && (
+                  <p className="text-center text-[7px] text-slate-500 mt-1">
+                    {fourierData.totalCoeffs} available
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="bg-slate-900 p-4 rounded-xl border border-blue-500 border-opacity-40">
+            <h3 className="text-blue-400 font-bold text-xs mb-3 uppercase flex items-center gap-2">
+              <Zap size={14} /> DEPHAZE (φ³)
+            </h3>
+            <div className="bg-black bg-opacity-50 p-3 rounded-lg mb-2">
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Storage</p>
+              <p className="text-2xl font-black text-blue-500">
+                {compressionMode === 'fourier' 
+                  ? `${(metrics.dephazeSize).toFixed(0)} B` 
+                  : `${(metrics.dephazeSize/1024).toFixed(1)} KB`
+                }
+              </p>
+            </div>
+            <div className="bg-black bg-opacity-50 p-3 rounded-lg">
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Method</p>
+              <p className="text-sm font-bold text-white">
+                {compressionMode === 'fourier' 
+                  ? `${fourierTopK} Fourier coeffs` 
+                  : `${phaseResolution}² cells`
+                }
+              </p>
             </div>
           </div>
 
-          <div className="bg-emerald-950 p-4 rounded-xl border border-emerald-600 border-opacity-40">
-            <h3 className="text-emerald-400 font-bold text-[10px] mb-2 uppercase flex items-center gap-2">
-              <Target size={12} /> Ξ Stabilitás
+          <div className="bg-emerald-950 bg-opacity-50 p-4 rounded-xl border border-emerald-600 border-opacity-50">
+            <h3 className="text-emerald-400 font-bold text-xs mb-3 uppercase flex items-center gap-2">
+              <Target size={14} /> Ξ Stability
             </h3>
-            <div className="text-center mb-2">
-              <p className="text-3xl font-black text-white">{metrics.xiStability}%</p>
+            <div className="text-center mb-3">
+              <p className="text-4xl font-black text-white">{metrics.xiStability}%</p>
+              <p className="text-[8px] text-slate-500 mt-1">Error: {metrics.avgError}%</p>
             </div>
-            <div className="text-center pt-2 border-t border-emerald-800">
-              <p className="text-2xl font-black text-white">{metrics.ratio}×</p>
-              <p className="text-[7px] text-slate-400 uppercase">Kompresszió</p>
+            <div className="text-center pt-3 border-t border-emerald-800">
+              <p className={`text-4xl font-black ${
+                compressionMode === 'fourier' ? 'text-green-400' : 'text-emerald-400'
+              }`}>
+                {metrics.compressionVsMesh}×
+              </p>
+              <p className="text-[8px] text-slate-400 uppercase tracking-wider">vs Mesh</p>
+              {compressionMode === 'fourier' && parseInt(metrics.compressionVsMesh) > 50 && (
+                <div className="mt-2 bg-green-900 bg-opacity-30 p-2 rounded">
+                  <p className="text-[8px] text-green-300 font-bold">🔥 EXTREME COMPRESSION!</p>
+                </div>
+              )}
             </div>
           </div>
         </div>
 
         <div className="lg:col-span-2 space-y-3">
-          <div className="bg-slate-900 rounded-2xl border border-slate-800 p-4 relative">
-            <div className="absolute top-4 left-4 space-y-1 z-10">
+          <div className="bg-slate-900 bg-opacity-70 rounded-2xl border border-slate-700 p-4 relative overflow-hidden">
+            <div className="absolute top-4 left-4 space-y-1.5 z-10 bg-black bg-opacity-60 p-3 rounded-lg backdrop-blur-sm">
               <div className="flex items-center gap-2">
-                <div className="w-2 h-2 bg-red-500 rounded-full" />
-                <span className="text-[8px] text-red-400 uppercase">ϕ⁻³ Szkennelt</span>
+                <div className="w-3 h-3 bg-red-500 rounded-full shadow-lg shadow-red-500/50" />
+                <span className="text-[9px] text-red-300 uppercase">φ⁻³ Mesh</span>
               </div>
               <div className="flex items-center gap-2">
-                <div className="w-2 h-2 bg-blue-500 rounded-full" />
-                <span className="text-[8px] text-blue-400 uppercase">ϕ³ Fázistérkép</span>
+                <div className={`w-3 h-3 rounded-full shadow-lg ${
+                  compressionMode === 'fourier' 
+                    ? 'bg-green-500 shadow-green-500/50' 
+                    : 'bg-blue-500 shadow-blue-500/50'
+                }`} />
+                <span className={`text-[9px] uppercase ${
+                  compressionMode === 'fourier' ? 'text-green-300' : 'text-blue-300'
+                }`}>
+                  φ³ {compressionMode === 'fourier' ? 'Fourier' : 'Spatial'}
+                </span>
               </div>
             </div>
 
             <div className="absolute top-4 right-4 flex gap-1 z-10">
               <button 
                 onClick={() => setViewMode('mesh')}
-                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'mesh' ? 'bg-red-600' : 'bg-slate-800'}`}
+                className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
+                  viewMode === 'mesh' ? 'bg-red-600' : 'bg-slate-800 hover:bg-slate-700'
+                }`}
               >
-                ϕ⁻³
+                φ⁻³
               </button>
               <button 
                 onClick={() => setViewMode('dephaze')}
-                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'dephaze' ? 'bg-blue-600' : 'bg-slate-800'}`}
+                className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
+                  viewMode === 'dephaze' ? 'bg-blue-600' : 'bg-slate-800 hover:bg-slate-700'
+                }`}
               >
-                ϕ³
+                φ³
               </button>
               <button 
                 onClick={() => setViewMode('both')}
-                className={`px-2 py-1 text-[8px] rounded ${viewMode === 'both' ? 'bg-purple-600' : 'bg-slate-800'}`}
+                className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
+                  viewMode === 'both' ? 'bg-purple-600' : 'bg-slate-800 hover:bg-slate-700'
+                }`}
               >
                 BOTH
               </button>
@@ -305,57 +510,75 @@ const DephazePhaseMap = () => {
                   });
                 }
               }}
-              className="cursor-grab active:cursor-grabbing w-full"
+              className="cursor-grab active:cursor-grabbing w-full rounded-lg"
             />
+            
+            <p className="text-center text-[8px] text-slate-500 mt-2 uppercase tracking-wider">
+              Drag to rotate
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
-            <div className="bg-slate-900 p-3 rounded-xl">
-              <h3 className="text-purple-400 text-[9px] mb-2 uppercase flex items-center gap-1">
-                <Cpu size={10} /> Fázis Felbontás
+            <div className="bg-slate-900 bg-opacity-70 p-4 rounded-xl border border-purple-500 border-opacity-30">
+              <h3 className="text-purple-400 text-[10px] mb-3 uppercase flex items-center gap-2 font-bold">
+                <Cpu size={12} /> Phase Resolution
               </h3>
               <input 
                 type="range" min="16" max="64" step="8" value={phaseResolution}
                 onChange={(e) => setPhaseResolution(parseInt(e.target.value))}
-                className="w-full h-1 bg-slate-800 rounded-lg accent-purple-500 mb-2"
+                className="w-full h-2 bg-slate-800 rounded-lg"
               />
-              <p className="text-center text-xl font-bold text-white">{phaseResolution}×{phaseResolution}</p>
+              <div className="text-center mt-3">
+                <p className="text-2xl font-black text-white">{phaseResolution}²</p>
+              </div>
             </div>
 
-            <div className="bg-slate-900 p-3 rounded-xl">
-              <h3 className="text-cyan-400 text-[9px] mb-2 uppercase flex items-center gap-1">
-                <Scan size={10} /> Szkennelés
+            <div className="bg-slate-900 bg-opacity-70 p-4 rounded-xl border border-cyan-500 border-opacity-30">
+              <h3 className="text-cyan-400 text-[10px] mb-3 uppercase flex items-center gap-2 font-bold">
+                <Scan size={12} /> Scan Density
               </h3>
               <input 
                 type="range" min="200" max="2000" step="200" value={scanDensity}
                 onChange={(e) => setScanDensity(parseInt(e.target.value))}
-                className="w-full h-1 bg-slate-800 rounded-lg accent-cyan-500 mb-2"
+                className="w-full h-2 bg-slate-800 rounded-lg"
               />
-              <p className="text-center text-xl font-bold text-white">{scanDensity}</p>
+              <div className="text-center mt-3">
+                <p className="text-2xl font-black text-white">{scanDensity}</p>
+              </div>
             </div>
           </div>
 
-          <div className="flex gap-2">
-            <button 
-              onClick={() => setMeshType('bumpy')}
-              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'bumpy' ? 'bg-purple-600' : 'bg-slate-800'}`}
-            >
-              BUMPY
-            </button>
-            <button 
-              onClick={() => setMeshType('spike')}
-              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'spike' ? 'bg-purple-600' : 'bg-slate-800'}`}
-            >
-              SPIKE
-            </button>
-            <button 
-              onClick={() => setMeshType('organic')}
-              className={`flex-1 p-2 rounded-lg text-[10px] font-bold ${meshType === 'organic' ? 'bg-purple-600' : 'bg-slate-800'}`}
-            >
-              ORGANIC
-            </button>
+          <div className="grid grid-cols-3 gap-2">
+            {['bumpy', 'spike', 'organic'].map(type => (
+              <button 
+                key={type}
+                onClick={() => setMeshType(type)}
+                className={`p-3 rounded-lg text-[10px] font-bold uppercase transition ${
+                  meshType === type 
+                    ? 'bg-gradient-to-br from-purple-600 to-purple-800 text-white shadow-lg' 
+                    : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                }`}
+              >
+                <div className="text-lg mb-1">
+                  {type === 'bumpy' ? '🌊' : type === 'spike' ? '⚡' : '🧬'}
+                </div>
+                {type}
+              </button>
+            ))}
           </div>
         </div>
+      </div>
+
+      <div className="mt-6 bg-slate-900 bg-opacity-50 p-4 rounded-lg border border-slate-700">
+        <p className="text-[9px] text-slate-400 text-center leading-relaxed">
+          <span className={compressionMode === 'fourier' ? 'text-green-400' : 'text-purple-400'}>
+            {compressionMode === 'fourier' ? '🌊 FOURIER MODE:' : '📊 SPATIAL MODE:'}
+          </span> {' '}
+          {compressionMode === 'fourier' 
+            ? `Using ${fourierTopK} frequency coefficients to reconstruct amorphous geometry. Low-frequency components capture smooth surfaces with ${metrics.compressionVsMesh}× compression vs mesh.`
+            : `Using ${phaseResolution}×${phaseResolution} phase map cells. Spatial domain reconstruction with ${metrics.ratio}× compression.`
+          }
+        </p>
       </div>
     </div>
   );
