@@ -2,22 +2,21 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 import { Scan, Zap, Cpu, Target, Database, Atom, Waves } from "lucide-react";
 
 /**
- * DEPHAZE Phase Map — φ³ SPACE + LOG-DOMAIN PROJECTION (Mode 2)
+ * DEPHAZE Phase Map — φ³ SPACE + LOG-DOMAIN + (θ Fourier × φ DCT)  [SIZE FIX]
  *
- * Core idea (as you defined):
- * - xyz scan points are a "false edge" (φ⁻³).
- * - We do NOT compute in xyz-space.
- * - We map every direction (θ,φ) into a φ³ vortex space (θφ3, φφ3).
- * - In φ³-space we store/compress the "true" field in LOG domain:
- *     log r' = log r + Δφ3
- *   Operationally: we reconstruct logR in φ³ space and use it as corrected log radius.
+ * Your report: "Fourier 91, túl kicsire csinálja a modellt"
  *
- * Compression:
- * - φ is not periodic → use DCT-II along φφ3
- * - θ is periodic → use complex Fourier along θφ3
- * - Top-K coefficients kept
+ * Two concrete fixes:
+ * 1) DCT-II scaling fix:
+ *    - DCT inverse needs a factor ~2 for kPhi>0 modes (alpha_k). Without it, variance is suppressed,
+ *      and the shape collapses toward the mean (often "too small" in your log-radius setup).
  *
- * Deterministic, time-less mapping.
+ * 2) Global size (mean radius) correction in LOG domain:
+ *    - We compute avgR_scan and avgR_recon (quick sample) and apply:
+ *        logR += log(avgR_scan / avgR_recon)
+ *      This keeps Fourier from shrinking/expanding the whole object.
+ *
+ * Still time-less math: deterministic mapping + deterministic compression + deterministic reconstruction.
  */
 
 const DephazePhaseMap = () => {
@@ -30,7 +29,7 @@ const DephazePhaseMap = () => {
   const [meshType, setMeshType] = useState("bumpy");
   const [viewMode, setViewMode] = useState("both");
   const [compressionMode, setCompressionMode] = useState("spatial"); // 'spatial' or 'fourier'
-  const [fourierTopK, setFourierTopK] = useState(80);
+  const [fourierTopK, setFourierTopK] = useState(100);
 
   // Constants
   const PHI3 = 4.2360679;
@@ -40,19 +39,15 @@ const DephazePhaseMap = () => {
   const wrap2pi = (a) => ((a % TAU) + TAU) % TAU;
 
   // φ³ vortex direction warp: (θ,φ) -> (θφ3, φφ3)
-  // This defines the φ³-space coordinates (time-less).
   const phi3VortexDirWarp = (theta, phi) => {
-    // unit direction in xyz
     const ux = Math.sin(phi) * Math.cos(theta);
     const uy = Math.sin(phi) * Math.sin(theta);
     const uz = Math.cos(phi);
 
-    // φ³ warp in components (symmetry break / vortex-space embedding)
     const wx = Math.sign(ux) * Math.pow(Math.abs(ux), PHI3);
     const wy = Math.sign(uy) * Math.pow(Math.abs(uy), PHI3);
     const wz = Math.sign(uz) * Math.pow(Math.abs(uz), PHI3);
 
-    // normalize back to unit direction in φ³-space
     const norm = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1e-12;
     const vx = wx / norm;
     const vy = wy / norm;
@@ -60,7 +55,6 @@ const DephazePhaseMap = () => {
 
     const thetaP = wrap2pi(Math.atan2(vy, vx));
     const phiP = Math.acos(Math.max(-1, Math.min(1, vz)));
-
     return { thetaP, phiP };
   };
 
@@ -73,7 +67,6 @@ const DephazePhaseMap = () => {
   };
 
   // === 1) SCAN (φ⁻³) ===
-  // We still generate "true" R for evaluation, but treat xyz as false edge input.
   const scannedPoints = useMemo(() => {
     const points = [];
     for (let i = 0; i < scanDensity; i++) {
@@ -92,14 +85,11 @@ const DephazePhaseMap = () => {
         R += 0.15 * Math.cos(theta * 4.1) * Math.sin(phi * 3.3);
       }
 
-      // false-edge xyz (observable)
       const x = R * Math.sin(phi) * Math.cos(theta);
       const y = R * Math.sin(phi) * Math.sin(theta);
       const z = R * Math.cos(phi);
 
-      // φ³-space coords (true space)
       const { thetaP, phiP } = phi3VortexDirWarp(theta, phi);
-
       const logR = toLogR(R);
 
       points.push({ x, y, z, theta, phi, R, logR, thetaP, phiP });
@@ -110,8 +100,6 @@ const DephazePhaseMap = () => {
   // === 2) PHASE MAP IN φ³-SPACE (store logR) ===
   const phaseMap = useMemo(() => {
     const N = phaseResolution;
-
-    // default logR for R=2.0
     const defaultLogR = toLogR(2.0);
 
     const map = Array(N)
@@ -122,7 +110,6 @@ const DephazePhaseMap = () => {
           .map(() => ({ logR: defaultLogR, count: 0 }))
       );
 
-    // optional: virtual injection weight (kept small; φ³-space already does the heavy lifting)
     const virtualWeight = 0.2;
 
     const addSample = (thetaP, phiP, logR, weight = 1.0) => {
@@ -135,23 +122,20 @@ const DephazePhaseMap = () => {
         cell.logR = logR;
         cell.count = weight;
       } else {
-        cell.logR =
-          (cell.logR * cell.count + logR * weight) / (cell.count + weight);
+        cell.logR = (cell.logR * cell.count + logR * weight) / (cell.count + weight);
         cell.count += weight;
       }
     };
 
-    // measured points in φ³-space
     scannedPoints.forEach((p) => {
       addSample(p.thetaP, p.phiP, p.logR, 1.0);
 
-      // virtual point: one extra φ³ "pull" direction (a second warp pass)
-      // this is deterministic and time-less: warp φ³ coords again
+      // deterministic "virtual pull" (second warp in φ³ space)
       const v2 = phi3VortexDirWarp(p.thetaP, p.phiP);
       addSample(v2.thetaP, v2.phiP, p.logR, virtualWeight);
     });
 
-    // fill empty cells (θ wraps, φ clamps)
+    // Fill empty cells
     for (let i = 0; i < N; i++) {
       for (let j = 0; j < N; j++) {
         if (map[i][j].count === 0) {
@@ -162,7 +146,6 @@ const DephazePhaseMap = () => {
 
           let sum = 0;
           let cnt = 0;
-
           if (map[i1][j].count > 0) { sum += map[i1][j].logR; cnt++; }
           if (map[i2][j].count > 0) { sum += map[i2][j].logR; cnt++; }
           if (map[i][j1].count > 0) { sum += map[i][j1].logR; cnt++; }
@@ -195,11 +178,10 @@ const DephazePhaseMap = () => {
     const dc = dcSum / (N * N);
 
     const allCoeffs = [];
-
     const maxFreqTheta = Math.floor(N / 2);
     const maxFreqPhi = N - 1;
 
-    // precompute cos(phi) basis for DCT
+    // precompute cos basis for DCT-II
     const cosPhi = Array(maxFreqPhi + 1)
       .fill(null)
       .map((_, k) =>
@@ -223,7 +205,6 @@ const DephazePhaseMap = () => {
           for (let j = 0; j < N; j++) {
             const val = matrix[i][j] - dc;
             const bP = cosPhi[kPhi][j];
-
             real += val * cT * bP;
             imag += val * sT * bP;
           }
@@ -233,16 +214,12 @@ const DephazePhaseMap = () => {
         const norm = N * N;
         const r = real / norm;
         const im = imag / norm;
+
+        // amplitude estimate for sorting
         const amp = Math.sqrt(r * r + im * im);
 
         if (amp > 0.00002) {
-          allCoeffs.push({
-            kTheta,
-            kPhi,
-            real: r,
-            imag: im,
-            amplitude: amp,
-          });
+          allCoeffs.push({ kTheta, kPhi, real: r, imag: im, amplitude: amp });
         }
       }
     }
@@ -250,39 +227,87 @@ const DephazePhaseMap = () => {
     allCoeffs.sort((a, b) => b.amplitude - a.amplitude);
     const top = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
 
-    return {
-      dc,
-      N,
-      coefficients: top,
-      totalCoeffs: allCoeffs.length,
-    };
+    return { dc, N, coefficients: top, totalCoeffs: allCoeffs.length };
   }, [compressionMode, phaseMap, phaseResolution, fourierTopK]);
 
-  // === 4) Reconstruction in φ³-space, then output corrected R' (log-domain) ===
+  // === 4) Size correction in LOG domain (fixes "too small model") ===
+  const logScaleCorrection = useMemo(() => {
+    if (compressionMode !== "fourier" || !fourierData) return 0;
+
+    // avg R from scan (target "size")
+    let sumScan = 0;
+    for (const p of scannedPoints) sumScan += p.R;
+    const avgScan = sumScan / Math.max(1, scannedPoints.length);
+
+    // quick sampling of reconstructed R to estimate global scale
+    const sampleRes = 18;
+    let sumRec = 0;
+    let cnt = 0;
+
+    for (let i = 0; i <= sampleRes; i++) {
+      const theta = (i / sampleRes) * TAU;
+      for (let j = 0; j <= sampleRes; j++) {
+        const phi = (j / sampleRes) * Math.PI;
+
+        // reconstruct logR in φ³-space using current Fourier data (with DCT scaling fix below)
+        const N = phaseResolution;
+        const { thetaP, phiP } = phi3VortexDirWarp(theta, phi);
+        const ti = (thetaP / TAU) * N;
+        const tj = (phiP / Math.PI) * N;
+
+        let logR = fourierData.dc;
+
+        for (const c of fourierData.coefficients) {
+          const ang = TAU * (c.kTheta * ti / N);
+          const cT = Math.cos(ang);
+          const sT = Math.sin(ang);
+
+          const bP = Math.cos(Math.PI * c.kPhi * (tj + 0.5) / N);
+
+          // ✅ DCT-II inverse scaling: multiply kPhi>0 by 2
+          const alphaPhi = c.kPhi === 0 ? 1 : 2;
+
+          logR += (c.real * cT - c.imag * sT) * bP * alphaPhi;
+        }
+
+        sumRec += fromLogR(logR);
+        cnt++;
+      }
+    }
+
+    const avgRec = sumRec / Math.max(1, cnt);
+
+    // correction in log domain
+    const corr = Math.log(Math.max(EPS, avgScan) / Math.max(EPS, avgRec));
+    return Number.isFinite(corr) ? corr : 0;
+  }, [compressionMode, fourierData, scannedPoints, phaseResolution]);
+
+  // === 5) Reconstruction in φ³-space ===
   const reconstructR = (theta, phi) => {
     const N = phaseResolution;
-
-    // project query direction into φ³-space (the real space)
     const { thetaP, phiP } = phi3VortexDirWarp(theta, phi);
 
     if (compressionMode === "fourier" && fourierData) {
-      const { dc, coefficients } = fourierData;
-
       const ti = (thetaP / TAU) * N;
       const tj = (phiP / Math.PI) * N;
 
-      let logR = dc;
+      let logR = fourierData.dc;
 
-      for (const c of coefficients) {
+      for (const c of fourierData.coefficients) {
         const ang = TAU * (c.kTheta * ti / N);
         const cT = Math.cos(ang);
         const sT = Math.sin(ang);
 
         const bP = Math.cos(Math.PI * c.kPhi * (tj + 0.5) / N);
 
-        // add contribution
-        logR += (c.real * cT - c.imag * sT) * bP;
+        // ✅ DCT-II inverse scaling factor
+        const alphaPhi = c.kPhi === 0 ? 1 : 2;
+
+        logR += (c.real * cT - c.imag * sT) * bP * alphaPhi;
       }
+
+      // ✅ global size correction in log domain
+      logR += logScaleCorrection;
 
       return fromLogR(logR);
     }
@@ -295,7 +320,7 @@ const DephazePhaseMap = () => {
     return fromLogR(phaseMap[ti][tj].logR);
   };
 
-  // === 5) Metrics ===
+  // === 6) Metrics ===
   const metrics = useMemo(() => {
     const meshSize = scanDensity * 12;
 
@@ -323,9 +348,9 @@ const DephazePhaseMap = () => {
       avgError: (avgError * 100).toFixed(2),
       compressionVsMesh: (meshSize / dephazeSize).toFixed(0),
     };
-  }, [scannedPoints, phaseMap, phaseResolution, scanDensity, compressionMode, fourierTopK, fourierData]);
+  }, [scannedPoints, phaseMap, phaseResolution, scanDensity, compressionMode, fourierTopK, fourierData, logScaleCorrection]);
 
-  // === 6) Renderer ===
+  // === 7) Renderer ===
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -347,7 +372,6 @@ const DephazePhaseMap = () => {
     const scale = 90;
     const pts = [];
 
-    // reconstructed dephaze points
     if (viewMode !== "mesh") {
       const res = 42;
       for (let i = 0; i <= res; i++) {
@@ -375,7 +399,6 @@ const DephazePhaseMap = () => {
       }
     }
 
-    // scanned mesh points
     if (viewMode !== "dephaze") {
       scannedPoints.slice(0, 250).forEach((p) => {
         const cosX = Math.cos(rotation.x);
@@ -420,7 +443,7 @@ const DephazePhaseMap = () => {
         ctx.fill();
       }
     });
-  }, [rotation, scannedPoints, phaseMap, viewMode, phaseResolution, compressionMode, fourierData]);
+  }, [rotation, scannedPoints, phaseMap, viewMode, phaseResolution, compressionMode, fourierData, logScaleCorrection]);
 
   return (
     <div className="p-6 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
@@ -428,8 +451,12 @@ const DephazePhaseMap = () => {
         <h1 className="text-4xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase tracking-wider">
           DEPHAZE Phase Map
         </h1>
-        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">φ³ SPACE + LOG PROJECTION (MODE 2)</p>
-        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">Ω₀ → φ³ ↔ φ⁻³ → Ξ=1</p>
+        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">
+          φ³ SPACE + LOG PROJECTION (MODE 2) — DCT SCALE + LOG SIZE FIX
+        </p>
+        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">
+          Ω₀ → φ³ ↔ φ⁻³ → log r' = log r + Δφ³
+        </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -439,10 +466,10 @@ const DephazePhaseMap = () => {
               <Atom size={14} /> DEPHAZE Axioms
             </h3>
             <div className="text-[9px] text-purple-200 space-y-1.5 leading-relaxed">
-              <p><span className="text-purple-400">Ω₀:</span> 0 reference anchor</p>
-              <p><span className="text-purple-400">φ³:</span> Real space (vortex-warped direction)</p>
-              <p><span className="text-purple-400">φ⁻³:</span> Scan edge (xyz) – input only</p>
-              <p><span className="text-purple-400">Mode 2:</span> log r' = log r + Δφ³</p>
+              <p><span className="text-purple-400">Ω₀:</span> 0 anchor</p>
+              <p><span className="text-purple-400">φ³:</span> real space (vortex dir-warp)</p>
+              <p><span className="text-purple-400">φ⁻³:</span> xyz edge (input only)</p>
+              <p><span className="text-purple-400">Mode 2:</span> log-domain correction</p>
             </div>
           </div>
 
@@ -490,16 +517,16 @@ const DephazePhaseMap = () => {
                 <p className="text-[8px] text-slate-400 mb-2 uppercase">Top-K Coefficients</p>
                 <input
                   type="range"
-                  min="20"
-                  max="220"
+                  min="40"
+                  max="260"
                   step="10"
                   value={fourierTopK}
                   onChange={(e) => setFourierTopK(parseInt(e.target.value))}
                   className="w-full h-1 bg-slate-800 rounded-lg"
                 />
                 <div className="flex justify-between text-[7px] text-slate-500 mt-1 mb-2">
-                  <span>20</span>
-                  <span>220</span>
+                  <span>40</span>
+                  <span>260</span>
                 </div>
                 <p className="text-center text-lg font-bold text-green-400">K = {fourierTopK}</p>
                 {fourierData && (
@@ -671,8 +698,8 @@ const DephazePhaseMap = () => {
             {compressionMode === "fourier" ? "🌊 FOURIER MODE:" : "📊 SPATIAL MODE:"}
           </span>{" "}
           {compressionMode === "fourier"
-            ? `We compress logR in φ³-space using θ Fourier × φ DCT. This avoids the “xyz false edge” fitting and targets φ³ projection directly.`
-            : `Spatial φ³ logR map (no Fourier). This is the direct φ³-space projection representation.`}
+            ? `DCT inverse scaling (kPhi>0 ×2) + log-size correction keeps the model from collapsing/shrinking.`
+            : `Spatial φ³ logR-map (no compression loss).`}
         </p>
       </div>
     </div>
