@@ -2,16 +2,17 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 import { Scan, Zap, Cpu, Target, Database, Atom, Waves } from "lucide-react";
 
 /**
- * DEPHAZE Phase Map (Audio-style Imago Field + Mirror-Φ Fourier) — FIXED
+ * DEPHAZE Phase Map — Fourier FIX (φ is NOT periodic)
  *
- * Fix applied (critical):
- * - Mirror-φ DFT uses M=2N columns, but the real physical φ in [0..π] occupies ONLY the first half.
- * - Therefore reconstruction MUST map φ to index range [0..N], NOT [0..M].
- *   Before (wrong): tj = (phi/π)*M  -> doubles φ phase -> bad reconstruction (~86%)
- *   Now   (fixed): tj = (phi/π)*N  -> correct mapping into first half -> stable Fourier.
+ * You hit the classic plateau because φ ∈ [0..π] is not periodic, but 2D Fourier assumes periodic boundaries.
+ * Mirror helped avoid seams, but Top-K still likes "wrong" modes and you stick ~94%.
  *
- * Additional stabilizer:
- * - Limit ky bandwidth to N/2 (instead of M/2) to avoid top-K picking mirror-only modes.
+ * This version replaces the φ Fourier axis with a DCT-II (cosine basis) while keeping θ as Fourier.
+ * => θ periodic ✅, φ non-periodic ✅
+ *
+ * Fourier mode now is: (θ: complex Fourier) × (φ: cosine/DCT)
+ *
+ * Everything is still "time-less" math: deterministic mapping + deterministic compression + deterministic reconstruction.
  */
 
 const DephazePhaseMap = () => {
@@ -24,7 +25,7 @@ const DephazePhaseMap = () => {
   const [meshType, setMeshType] = useState("bumpy");
   const [viewMode, setViewMode] = useState("both");
   const [compressionMode, setCompressionMode] = useState("spatial"); // 'spatial' or 'fourier'
-  const [fourierTopK, setFourierTopK] = useState(40);
+  const [fourierTopK, setFourierTopK] = useState(60);
 
   // === Core constants ===
   const PHI3 = 4.2360679;
@@ -33,7 +34,7 @@ const DephazePhaseMap = () => {
 
   const wrap2pi = (a) => ((a % TAU) + TAU) % TAU;
 
-  // === Direction-only Xi (no time, no R dependency) ===
+  // === Direction-only Xi (no R dependency) ===
   const xiDir = (theta, phi) => {
     const ux = Math.sin(phi) * Math.cos(theta);
     const uy = Math.sin(phi) * Math.sin(theta);
@@ -49,7 +50,7 @@ const DephazePhaseMap = () => {
     return 1 / Math.max(denom, 1e-12);
   };
 
-  // Audio-style direction vortex scalar
+  // "Audio-style" direction vortex scalar
   const vortexDir = (theta, phi) => PHI3 * xiDir(theta, phi);
 
   // Encode field F = log(R+eps) * V(dir)
@@ -130,7 +131,8 @@ const DephazePhaseMap = () => {
           .map(() => ({ F: encodeFieldF(2.0, 0, Math.PI / 2), count: 0 }))
       );
 
-    const virtualWeight = 0.45;
+    // NOTE: virtual points help shape the field, but too much can hurt spatial accuracy.
+    const virtualWeight = 0.35;
 
     const addSample = (theta, phi, F, weight = 1.0) => {
       const ti = Math.floor((theta / TAU) * N) % N;
@@ -154,7 +156,7 @@ const DephazePhaseMap = () => {
       addSample(thetaV, phiV, p.F, virtualWeight);
     });
 
-    // Fill holes
+    // Fill holes (θ wraps, φ clamps)
     for (let i = 0; i < N; i++) {
       for (let j = 0; j < N; j++) {
         if (map[i][j].count === 0) {
@@ -198,86 +200,106 @@ const DephazePhaseMap = () => {
     return map;
   }, [scannedPoints, phaseResolution]);
 
-  // === 3) FOURIER DFT with MIRROR φ extension ===
+  // === 3) FOURIER (θ periodic) × DCT-II (φ non-periodic) ===
   const fourierData = useMemo(() => {
     if (compressionMode !== "fourier") return null;
 
     const N = phaseResolution;
-    const M = 2 * N;
 
-    const matrix = Array(N)
-      .fill(null)
-      .map((_, i) => {
-        const base = phaseMap[i].map((c) => c.F); // length N
-        const mirror = [...base].reverse(); // length N
-        return base.concat(mirror); // length 2N
-      });
+    // matrix[i][j] = F at theta-bin i, phi-bin j
+    const matrix = phaseMap.map((row) => row.map((c) => c.F));
 
     // DC
     let dcSum = 0;
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < M; j++) dcSum += matrix[i][j];
-    }
-    const dc = dcSum / (N * M);
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) dcSum += matrix[i][j];
+    const dc = dcSum / (N * N);
 
     const allCoeffs = [];
-    const maxFreqX = Math.floor(N / 2);
-    const maxFreqY = Math.floor(N / 2); // <== stabilizer (was M/2)
 
-    for (let kx = -maxFreqX; kx <= maxFreqX; kx++) {
-      for (let ky = -maxFreqY; ky <= maxFreqY; ky++) {
-        if (kx === 0 && ky === 0) continue;
+    const maxFreqTheta = Math.floor(N / 2);
+    const maxFreqPhi = N - 1; // DCT modes: 0..N-1 (we'll include 1..N-1 here)
+
+    // Basis in φ (DCT-II): cos(pi*k*(j+0.5)/N)
+    const cosPhi = Array(maxFreqPhi + 1)
+      .fill(null)
+      .map((_, k) =>
+        Array(N)
+          .fill(0)
+          .map((__, j) => Math.cos(Math.PI * k * (j + 0.5) / N))
+      );
+
+    for (let kTheta = -maxFreqTheta; kTheta <= maxFreqTheta; kTheta++) {
+      for (let kPhi = 0; kPhi <= maxFreqPhi; kPhi++) {
+        if (kTheta === 0 && kPhi === 0) continue;
 
         let real = 0;
         let imag = 0;
 
         for (let i = 0; i < N; i++) {
-          for (let j = 0; j < M; j++) {
-            const angle = -TAU * (kx * i / N + ky * j / M);
+          const ang = -TAU * (kTheta * i / N);
+          const cT = Math.cos(ang);
+          const sT = Math.sin(ang);
+
+          for (let j = 0; j < N; j++) {
             const val = matrix[i][j] - dc;
-            real += val * Math.cos(angle);
-            imag += val * Math.sin(angle);
+            const bP = cosPhi[kPhi][j];
+            // complex Fourier in θ, cosine in φ
+            real += val * cT * bP;
+            imag += val * sT * bP;
           }
         }
 
-        const norm = N * M;
-        const amplitude = Math.sqrt(real * real + imag * imag) / norm;
+        // Normalize
+        const norm = N * N;
+        const r = real / norm;
+        const im = imag / norm;
+        const amp = Math.sqrt(r * r + im * im);
 
-        if (amplitude > 0.00005) {
+        if (amp > 0.00005) {
           allCoeffs.push({
-            kx,
-            ky,
-            real: real / norm,
-            imag: imag / norm,
-            amplitude,
+            kTheta,
+            kPhi,
+            real: r,
+            imag: im,
+            amplitude: amp,
           });
         }
       }
     }
 
     allCoeffs.sort((a, b) => b.amplitude - a.amplitude);
-    const topCoeffs = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
+    const top = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
 
-    return { dc, N, M, coefficients: topCoeffs, totalCoeffs: allCoeffs.length };
+    return {
+      dc,
+      N,
+      coefficients: top,
+      totalCoeffs: allCoeffs.length,
+    };
   }, [compressionMode, phaseMap, phaseResolution, fourierTopK]);
 
-  // === 4) Reconstruction: FIXED tj mapping ===
+  // === 4) Reconstruction ===
   const reconstructR = (theta, phi) => {
     const N = phaseResolution;
 
     if (compressionMode === "fourier" && fourierData) {
-      const { dc, coefficients, M } = fourierData;
+      const { dc, coefficients } = fourierData;
 
       const ti = (theta / TAU) * N;
-
-      // ✅ FIX: map φ only into the FIRST HALF (0..N) of the mirror grid
-      // (the physical domain lives there)
-      const tj = (phi / Math.PI) * N;
+      const tj = (phi / Math.PI) * N; // 0..N
 
       let F = dc;
+
       for (const c of coefficients) {
-        const angle = TAU * (c.kx * ti / N + c.ky * tj / M);
-        F += c.real * Math.cos(angle) - c.imag * Math.sin(angle);
+        const ang = TAU * (c.kTheta * ti / N);
+        const cT = Math.cos(ang);
+        const sT = Math.sin(ang);
+
+        // DCT-II basis uses (j+0.5); keep it continuous by using tj as "j"
+        const bP = Math.cos(Math.PI * c.kPhi * (tj + 0.5) / N);
+
+        // (real + i imag) * e^{i ang} => real*cT - imag*sT
+        F += (c.real * cT - c.imag * sT) * bP;
       }
 
       return decodeFieldToR(F, theta, phi);
@@ -304,9 +326,9 @@ const DephazePhaseMap = () => {
 
     let errorSum = 0;
     for (const p of scannedPoints) {
-      const r2 = reconstructR(p.theta, p.phi);
-      errorSum += Math.abs(r2 - p.R);
+      errorSum += Math.abs(reconstructR(p.theta, p.phi) - p.R);
     }
+
     const avgError = errorSum / Math.max(1, scannedPoints.length);
     const xiStability = Math.max(0, 100 - avgError * 50);
 
@@ -340,7 +362,7 @@ const DephazePhaseMap = () => {
     const centerX = width / 2;
     const centerY = height / 2;
     const scale = 90;
-    const points = [];
+    const pts = [];
 
     if (viewMode !== "mesh") {
       const res = 42;
@@ -364,7 +386,7 @@ const DephazePhaseMap = () => {
           const x2 = x * cosY + z1 * sinY;
           const z2 = -x * sinY + z1 * cosY;
 
-          points.push({ x: x2, y: y1, z: z2, type: "dephaze" });
+          pts.push({ x: x2, y: y1, z: z2, type: "dephaze" });
         }
       }
     }
@@ -381,13 +403,13 @@ const DephazePhaseMap = () => {
         const x2 = p.x * cosY + z1 * sinY;
         const z2 = -p.x * sinY + z1 * cosY;
 
-        points.push({ x: x2, y: y1, z: z2, type: "mesh" });
+        pts.push({ x: x2, y: y1, z: z2, type: "mesh" });
       });
     }
 
-    points.sort((a, b) => a.z - b.z);
+    pts.sort((a, b) => a.z - b.z);
 
-    points.forEach((p) => {
+    pts.forEach((p) => {
       const depth = (p.z + 3.5) / 7;
 
       if (p.type === "mesh") {
@@ -421,7 +443,7 @@ const DephazePhaseMap = () => {
         <h1 className="text-4xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase tracking-wider">
           DEPHAZE Phase Map
         </h1>
-        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">IMAGO FIELD (AUDIO-STYLE) + MIRROR-Φ FOURIER (FIXED)</p>
+        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">IMAGO FIELD + (θ Fourier × φ DCT) COMPRESSION</p>
         <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">Ω₀ → φ³ ↔ φ⁻³ → Ξ=1</p>
       </div>
 
@@ -432,18 +454,10 @@ const DephazePhaseMap = () => {
               <Atom size={14} /> DEPHAZE Axioms
             </h3>
             <div className="text-[9px] text-purple-200 space-y-1.5 leading-relaxed">
-              <p>
-                <span className="text-purple-400">Ω₀:</span> Invariant zero-point
-              </p>
-              <p>
-                <span className="text-purple-400">φ³:</span> Imago Field F = log(R)*V(dir)
-              </p>
-              <p>
-                <span className="text-purple-400">φ⁻³:</span> Measured pattern (scan)
-              </p>
-              <p>
-                <span className="text-purple-400">Ξ:</span> Lamé dir-invariant (PHI3)
-              </p>
+              <p><span className="text-purple-400">Ω₀:</span> Invariant zero-point</p>
+              <p><span className="text-purple-400">φ³:</span> Imago Field F = log(R)*V(dir)</p>
+              <p><span className="text-purple-400">φ⁻³:</span> Measured pattern (scan)</p>
+              <p><span className="text-purple-400">Ξ:</span> Lamé dir-invariant (PHI3)</p>
             </div>
           </div>
 
@@ -482,7 +496,7 @@ const DephazePhaseMap = () => {
                 }`}
               >
                 FOURIER
-                <div className="text-[7px] opacity-70">Mirror-Φ DFT</div>
+                <div className="text-[7px] opacity-70">θ-FFT + φ-DCT</div>
               </button>
             </div>
 
@@ -491,16 +505,16 @@ const DephazePhaseMap = () => {
                 <p className="text-[8px] text-slate-400 mb-2 uppercase">Top-K Coefficients</p>
                 <input
                   type="range"
-                  min="10"
-                  max="160"
+                  min="20"
+                  max="200"
                   step="10"
                   value={fourierTopK}
                   onChange={(e) => setFourierTopK(parseInt(e.target.value))}
                   className="w-full h-1 bg-slate-800 rounded-lg"
                 />
                 <div className="flex justify-between text-[7px] text-slate-500 mt-1 mb-2">
-                  <span>Smooth (10)</span>
-                  <span>Detailed (160)</span>
+                  <span>20</span>
+                  <span>200</span>
                 </div>
                 <p className="text-center text-lg font-bold text-green-400">K = {fourierTopK}</p>
                 {fourierData && (
@@ -672,8 +686,8 @@ const DephazePhaseMap = () => {
             {compressionMode === "fourier" ? "🌊 FOURIER MODE:" : "📊 SPATIAL MODE:"}
           </span>{" "}
           {compressionMode === "fourier"
-            ? `Mirror-φ DFT on Imago field F. (FIXED φ index mapping.) If you still see a plateau, increase Top-K and PhaseResolution.`
-            : `Spatial Imago map. High accuracy, fixed size vs scan density.`}
+            ? `θ is periodic (Fourier), φ is NOT periodic (DCT). This removes the φ seam issue that keeps you near ~94% with pure 2D Fourier.`
+            : `Spatial Imago field map. High accuracy, fixed size vs scan density.`}
         </p>
       </div>
     </div>
