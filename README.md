@@ -1,4 +1,6 @@
 # Dephaze-Topologies
+Dephaze-Topologies demonstrates a complexity-invariant, implicit geometry representation where storage size does not scale with geometric detail.
+
 ### The obsolescence of polygons. The emergence of implicit topology.
 
 [![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen?style=for-the-badge)](https://dephaze-topologies.vercel.app/)
