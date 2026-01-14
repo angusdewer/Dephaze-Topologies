@@ -1,25 +1,48 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import { Scan, Zap, Cpu, Target, Database, Atom, Waves } from "lucide-react";
 
+/**
+ * DEPHAZE Phase Map (Audio-style Imago Field + Mirror-Φ Fourier)
+ *
+ * What changed vs your previous version:
+ * 1) We DO NOT compress raw R directly.
+ *    We compress an "audio-like" scalar field:
+ *       V(theta,phi) = PHI3 * Xi_dir(direction)
+ *       F(theta,phi) = log(R + eps) * V
+ *    This is smoother and more Fourier-friendly.
+ *
+ * 2) Fourier uses MIRROR extension on φ (non-periodic axis) to kill seam artifacts:
+ *    matrix size is N x (2N). This typically breaks the ~94% plateau.
+ *
+ * 3) Optional "virtual point" injection (φ³ vortex direction warp) is INCLUDED,
+ *    but it is applied only when building the phase map (time-less).
+ *
+ * Notes:
+ * - The ANCHOR = 1e-55 from audio is NOT needed here because Xi is scale-invariant.
+ *   The big problem was φ non-periodicity + non-Fourier-friendly signal.
+ */
+
 const DephazePhaseMap = () => {
   const canvasRef = useRef(null);
+
+  // UI state
   const [rotation, setRotation] = useState({ x: 0.8, y: 0.5 });
   const [phaseResolution, setPhaseResolution] = useState(32);
   const [scanDensity, setScanDensity] = useState(500);
   const [meshType, setMeshType] = useState("bumpy");
   const [viewMode, setViewMode] = useState("both");
   const [compressionMode, setCompressionMode] = useState("spatial"); // 'spatial' or 'fourier'
-  const [fourierTopK, setFourierTopK] = useState(20);
+  const [fourierTopK, setFourierTopK] = useState(40);
 
-  // === PHI3 IMAGO PHASE HELPERS (direction-only, non-circular, time-less) ===
-  // Goal: make Fourier/spatial map more compressible by storing W = R * Xi_dir(direction),
-  // and additionally injecting a "virtual point" mapped by a Φ³ vortex (direction warp).
+  // === Core constants ===
   const PHI3 = 4.2360679;
   const TAU = 2 * Math.PI;
+  const EPS = 1e-6;
 
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
   const wrap2pi = (a) => ((a % TAU) + TAU) % TAU;
 
-  // Xi_dir depends ONLY on direction (theta, phi), not on R:
+  // === Direction-only Xi (no time, no R dependency) ===
   // Xi_dir = 1 / ( |ux|^PHI3 + |uy|^PHI3 + |uz|^PHI3 )^(1/PHI3)
   const xiDir = (theta, phi) => {
     const ux = Math.sin(phi) * Math.cos(theta);
@@ -36,14 +59,32 @@ const DephazePhaseMap = () => {
     return 1 / Math.max(denom, 1e-12);
   };
 
-  // Warped radius (what we store/compress):
-  //   W = R * Xi_dir  =>  R = W / Xi_dir
-  const warpR = (R, theta, phi) => R * xiDir(theta, phi);
-  const unwarpR = (W, theta, phi) => W / xiDir(theta, phi);
+  // "Audio-style" vortex scalar (direction-only)
+  const vortexDir = (theta, phi) => PHI3 * xiDir(theta, phi);
 
-  // Φ³ vortex direction warp (virtual point): (theta,phi) -> (thetaV,phiV)
-  // Time-less mapping: only uses direction unit-vector, applies φ³ power warp, then renormalize.
-  const phi3VortexDir = (theta, phi) => {
+  /**
+   * Audio-style field to compress:
+   *   F = log(R + eps) * V
+   * Reconstruction:
+   *   log(R + eps) = F / V  => R = exp(F/V) - eps
+   */
+  const encodeFieldF = (R, theta, phi) => {
+    const V = Math.max(vortexDir(theta, phi), 1e-9);
+    return Math.log(Math.max(EPS, R + EPS)) * V;
+  };
+
+  const decodeFieldToR = (F, theta, phi) => {
+    const V = Math.max(vortexDir(theta, phi), 1e-9);
+    const logR = F / V;
+    const R = Math.exp(logR) - EPS;
+    // guard
+    if (!Number.isFinite(R)) return 2.0;
+    return Math.max(0.5, Math.min(4.0, R));
+  };
+
+  // === Φ³ vortex direction warp (virtual point) ===
+  // Time-less mapping: direction unit-vector -> φ³ power warp -> renormalize -> new (thetaV, phiV)
+  const phi3VortexDirWarp = (theta, phi) => {
     const ux = Math.sin(phi) * Math.cos(theta);
     const uy = Math.sin(phi) * Math.sin(theta);
     const uz = Math.cos(phi);
@@ -63,10 +104,9 @@ const DephazePhaseMap = () => {
     return { thetaV, phiV };
   };
 
-  // === 1. SCANNING (φ⁻³ Observable Pattern) ===
+  // === 1) SCAN (φ⁻³) ===
   const scannedPoints = useMemo(() => {
     const points = [];
-
     for (let i = 0; i < scanDensity; i++) {
       const theta = Math.random() * TAU;
       const phi = Math.random() * Math.PI;
@@ -87,92 +127,88 @@ const DephazePhaseMap = () => {
       const y = R * Math.sin(phi) * Math.sin(theta);
       const z = R * Math.cos(phi);
 
-      const xi = xiDir(theta, phi);
-      const Rw = warpR(R, theta, phi);
+      const F = encodeFieldF(R, theta, phi);
 
-      points.push({ x, y, z, theta, phi, R, xi, Rw });
+      points.push({ x, y, z, theta, phi, R, F });
     }
-
     return points;
   }, [meshType, scanDensity]);
 
-  // === 2. PHASE MAP CONSTRUCTION (Spatial Domain) ===
-  // IMPORTANT: we store Rw (warped radius) instead of R,
-  // and we ALSO inject a virtual point via φ³ vortex mapping.
+  // === 2) PHASE MAP (store F, NOT R) + virtual point injection ===
   const phaseMap = useMemo(() => {
-    const map = Array(phaseResolution)
+    const N = phaseResolution;
+
+    // init with a reasonable default field at each direction
+    const map = Array(N)
       .fill(null)
       .map(() =>
-        Array(phaseResolution)
+        Array(N)
           .fill(null)
-          .map(() => ({ Rw: warpR(2.0, 0, Math.PI / 2), count: 0 }))
+          .map(() => ({ F: encodeFieldF(2.0, 0, Math.PI / 2), count: 0 }))
       );
 
-    const virtualWeight = 0.6; // TUNING: 0.3..0.8 (virtual contribution strength)
+    const virtualWeight = 0.45; // tuning 0.2..0.7
 
-    const addSample = (theta, phi, Rw, weight = 1.0) => {
-      const thetaIdx =
-        Math.floor((theta / TAU) * phaseResolution) % phaseResolution;
-      const phiIdx = Math.floor((phi / Math.PI) * phaseResolution);
+    const addSample = (theta, phi, F, weight = 1.0) => {
+      const ti = Math.floor((theta / TAU) * N) % N;
+      const tj = Math.floor((phi / Math.PI) * N);
+      if (tj < 0 || tj >= N) return;
 
-      if (phiIdx < 0 || phiIdx >= phaseResolution) return;
-
-      const cell = map[thetaIdx][phiIdx];
-
+      const cell = map[ti][tj];
       if (cell.count === 0) {
-        cell.Rw = Rw;
+        cell.F = F;
         cell.count = weight;
       } else {
-        cell.Rw = (cell.Rw * cell.count + Rw * weight) / (cell.count + weight);
+        cell.F = (cell.F * cell.count + F * weight) / (cell.count + weight);
         cell.count += weight;
       }
     };
 
     scannedPoints.forEach((p) => {
-      // (1) measured point
-      addSample(p.theta, p.phi, p.Rw, 1.0);
+      // measured point
+      addSample(p.theta, p.phi, p.F, 1.0);
 
-      // (2) virtual point via φ³ vortex (time-less)
-      const { thetaV, phiV } = phi3VortexDir(p.theta, p.phi);
-      addSample(thetaV, phiV, p.Rw, virtualWeight);
+      // virtual point (φ³ vortex warp)
+      const { thetaV, phiV } = phi3VortexDirWarp(p.theta, p.phi);
+      addSample(thetaV, phiV, p.F, virtualWeight);
     });
 
-    // Interpolate empty cells (simple 4-neighborhood fill)
-    for (let i = 0; i < phaseResolution; i++) {
-      for (let j = 0; j < phaseResolution; j++) {
+    // fill holes via neighbor average (θ wraps, φ clamps)
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) {
         if (map[i][j].count === 0) {
-          const i1 = (i - 1 + phaseResolution) % phaseResolution;
-          const i2 = (i + 1) % phaseResolution;
+          const i1 = (i - 1 + N) % N;
+          const i2 = (i + 1) % N;
           const j1 = Math.max(0, j - 1);
-          const j2 = Math.min(phaseResolution - 1, j + 1);
+          const j2 = Math.min(N - 1, j + 1);
 
           let sum = 0;
           let cnt = 0;
           if (map[i1][j].count > 0) {
-            sum += map[i1][j].Rw;
+            sum += map[i1][j].F;
             cnt++;
           }
           if (map[i2][j].count > 0) {
-            sum += map[i2][j].Rw;
+            sum += map[i2][j].F;
             cnt++;
           }
           if (map[i][j1].count > 0) {
-            sum += map[i][j1].Rw;
+            sum += map[i][j1].F;
             cnt++;
           }
           if (map[i][j2].count > 0) {
-            sum += map[i][j2].Rw;
+            sum += map[i][j2].F;
             cnt++;
           }
 
           if (cnt > 0) {
-            map[i][j].Rw = sum / cnt;
-            map[i][j].count = 0.000001;
+            map[i][j].F = sum / cnt;
+            map[i][j].count = 1e-6;
           } else {
-            const theta = ((i + 0.5) / phaseResolution) * TAU;
-            const phi = ((j + 0.5) / phaseResolution) * Math.PI;
-            map[i][j].Rw = warpR(2.0, theta, phi);
-            map[i][j].count = 0.000001;
+            const theta = ((i + 0.5) / N) * TAU;
+            const phi = ((j + 0.5) / N) * Math.PI;
+            map[i][j].F = encodeFieldF(2.0, theta, phi);
+            map[i][j].count = 1e-6;
           }
         }
       }
@@ -181,26 +217,33 @@ const DephazePhaseMap = () => {
     return map;
   }, [scannedPoints, phaseResolution]);
 
-  // === 3. FOURIER COMPRESSION (Frequency Domain) ===
-  // We compute DFT on the warped-radius field Rw(theta,phi).
+  // === 3) FOURIER (DFT) with MIRROR φ extension ===
   const fourierData = useMemo(() => {
     if (compressionMode !== "fourier") return null;
 
-    const matrix = phaseMap.map((row) => row.map((cell) => cell.Rw));
     const N = phaseResolution;
+    const M = 2 * N; // mirror φ dimension
 
-    // DC component
+    // Build N x (2N) matrix:
+    // [ F(theta,phi0..phiN-1) | F(theta,phiN-1..phi0) ]
+    const matrix = Array(N)
+      .fill(null)
+      .map((_, i) => {
+        const base = phaseMap[i].map((c) => c.F); // length N
+        const mirror = [...base].reverse(); // length N
+        return base.concat(mirror); // length 2N
+      });
+
+    // DC
     let dcSum = 0;
     for (let i = 0; i < N; i++) {
-      for (let j = 0; j < N; j++) {
-        dcSum += matrix[i][j];
-      }
+      for (let j = 0; j < M; j++) dcSum += matrix[i][j];
     }
-    const dc = dcSum / (N * N);
+    const dc = dcSum / (N * M);
 
     const allCoeffs = [];
     const maxFreqX = Math.floor(N / 2);
-    const maxFreqY = Math.floor(N / 2);
+    const maxFreqY = Math.floor(M / 2);
 
     for (let kx = -maxFreqX; kx <= maxFreqX; kx++) {
       for (let ky = -maxFreqY; ky <= maxFreqY; ky++) {
@@ -210,8 +253,8 @@ const DephazePhaseMap = () => {
         let imag = 0;
 
         for (let i = 0; i < N; i++) {
-          for (let j = 0; j < N; j++) {
-            const angle = -TAU * (kx * i / N + ky * j / N);
+          for (let j = 0; j < M; j++) {
+            const angle = -TAU * (kx * i / N + ky * j / M);
             const val = matrix[i][j] - dc;
             real += val * Math.cos(angle);
             imag += val * Math.sin(angle);
@@ -219,86 +262,85 @@ const DephazePhaseMap = () => {
         }
 
         const amplitude = Math.sqrt(real * real + imag * imag);
+        const norm = N * M;
 
-        if (amplitude > 0.0001) {
+        // keep only meaningful
+        if (amplitude / norm > 0.00005) {
           allCoeffs.push({
             kx,
             ky,
-            real: real / (N * N),
-            imag: imag / (N * N),
-            amplitude: amplitude / (N * N),
+            real: real / norm,
+            imag: imag / norm,
+            amplitude: amplitude / norm,
           });
         }
       }
     }
 
     allCoeffs.sort((a, b) => b.amplitude - a.amplitude);
-    const topCoeffs = allCoeffs.slice(
-      0,
-      Math.min(fourierTopK, allCoeffs.length)
-    );
+    const topCoeffs = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
 
     return {
-      coefficients: topCoeffs,
       dc,
-      N: phaseResolution,
+      N,
+      M,
+      coefficients: topCoeffs,
       totalCoeffs: allCoeffs.length,
     };
-  }, [phaseMap, phaseResolution, compressionMode, fourierTopK]);
+  }, [compressionMode, phaseMap, phaseResolution, fourierTopK]);
 
-  // === 4. RECONSTRUCTION ===
-  // Reconstruct R by reconstructing warped-radius Rw, then unwarping:
-  //   R = Rw / Xi_dir(theta,phi)
+  // === 4) Reconstruction: F -> R ===
   const reconstructR = (theta, phi) => {
+    const N = phaseResolution;
+
     if (compressionMode === "fourier" && fourierData) {
-      const N = fourierData.N;
+      const { dc, coefficients, M } = fourierData;
 
+      // continuous indices in the DFT grid
       const ti = (theta / TAU) * N;
-      const tj = (phi / Math.PI) * N;
 
-      let Rw = fourierData.dc;
+      // IMPORTANT:
+      // Our DFT φ grid is length M=2N, representing [0..π] mirrored.
+      // For real φ in [0..π], we map it to first half [0..N] and scale to M.
+      const tj = (phi / Math.PI) * M;
 
-      fourierData.coefficients.forEach((coeff) => {
-        const angle = TAU * (coeff.kx * ti / N + coeff.ky * tj / N);
-        const contribution =
-          coeff.real * Math.cos(angle) - coeff.imag * Math.sin(angle);
-        Rw += contribution;
-      });
+      let F = dc;
+      for (const c of coefficients) {
+        const angle = TAU * (c.kx * ti / N + c.ky * tj / M);
+        F += c.real * Math.cos(angle) - c.imag * Math.sin(angle);
+      }
 
-      const R = unwarpR(Rw, theta, phi);
-      return Math.max(0.5, Math.min(4.0, R));
+      return decodeFieldToR(F, theta, phi);
     }
 
-    // Spatial
-    const ti = Math.floor((theta / TAU) * phaseResolution) % phaseResolution;
-    const tj = Math.floor((phi / Math.PI) * phaseResolution);
+    // spatial lookup
+    const ti = Math.floor((theta / TAU) * N) % N;
+    const tj = Math.floor((phi / Math.PI) * N);
+    if (tj < 0 || tj >= N) return 2.0;
 
-    if (tj < 0 || tj >= phaseResolution) return 2.0;
-
-    return Math.max(
-      0.5,
-      Math.min(4.0, unwarpR(phaseMap[ti][tj].Rw, theta, phi))
-    );
+    const F = phaseMap[ti][tj].F;
+    return decodeFieldToR(F, theta, phi);
   };
 
-  // === 5. METRICS (Ξ Stability) ===
+  // === 5) Metrics ===
   const metrics = useMemo(() => {
-    const meshSize = scanDensity * 12;
-
+    const meshSize = scanDensity * 12; // xyz float32*3 = 12 bytes
     let dephazeSize;
+
     if (compressionMode === "fourier") {
+      // same accounting model: 16B header + 16B/coeff + 8B dc-ish
       dephazeSize = 16 + fourierTopK * 16 + 8;
     } else {
-      dephazeSize = 16 + phaseResolution * phaseResolution * 4;
+      dephazeSize = 16 + phaseResolution * phaseResolution * 4; // F map float32 model
     }
 
     let errorSum = 0;
-    scannedPoints.forEach((p) => {
-      const reconstructed = reconstructR(p.theta, p.phi);
-      errorSum += Math.abs(reconstructed - p.R);
-    });
+    for (const p of scannedPoints) {
+      const r2 = reconstructR(p.theta, p.phi);
+      errorSum += Math.abs(r2 - p.R);
+    }
 
-    const avgError = errorSum / scannedPoints.length;
+    const avgError = errorSum / Math.max(1, scannedPoints.length);
     const xiStability = Math.max(0, 100 - avgError * 50);
 
     return {
@@ -309,16 +351,9 @@ const DephazePhaseMap = () => {
       avgError: (avgError * 100).toFixed(2),
       compressionVsMesh: (meshSize / dephazeSize).toFixed(0),
     };
-  }, [
-    scannedPoints,
-    phaseMap,
-    phaseResolution,
-    scanDensity,
-    compressionMode,
-    fourierTopK,
-  ]);
+  }, [scannedPoints, phaseMap, phaseResolution, scanDensity, compressionMode, fourierTopK, fourierData]);
 
-  // === 6. 3D RENDERER ===
+  // === 6) Renderer ===
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -329,14 +364,8 @@ const DephazePhaseMap = () => {
 
     ctx.clearRect(0, 0, width, height);
 
-    const gradient = ctx.createRadialGradient(
-      width / 2,
-      height / 2,
-      0,
-      width / 2,
-      height / 2,
-      width / 2
-    );
+    // background
+    const gradient = ctx.createRadialGradient(width / 2, height / 2, 0, width / 2, height / 2, width / 2);
     gradient.addColorStop(0, "#0f172a");
     gradient.addColorStop(1, "#020617");
     ctx.fillStyle = gradient;
@@ -345,10 +374,12 @@ const DephazePhaseMap = () => {
     const centerX = width / 2;
     const centerY = height / 2;
     const scale = 90;
+
     const points = [];
 
+    // Dephaze reconstructed surface points
     if (viewMode !== "mesh") {
-      const res = 40;
+      const res = 42;
       for (let i = 0; i <= res; i++) {
         const theta = (i / res) * TAU;
         for (let j = 0; j <= res; j++) {
@@ -359,6 +390,7 @@ const DephazePhaseMap = () => {
           const y = R * Math.sin(phi) * Math.sin(theta);
           const z = R * Math.cos(phi);
 
+          // rotate
           const cosX = Math.cos(rotation.x);
           const sinX = Math.sin(rotation.x);
           const y1 = y * cosX - z * sinX;
@@ -374,6 +406,7 @@ const DephazePhaseMap = () => {
       }
     }
 
+    // Raw mesh points
     if (viewMode !== "dephaze") {
       scannedPoints.slice(0, 250).forEach((p) => {
         const cosX = Math.cos(rotation.x);
@@ -398,55 +431,27 @@ const DephazePhaseMap = () => {
       if (p.type === "mesh") {
         ctx.fillStyle = `rgba(255, 60, 60, ${0.5 + depth * 0.4})`;
         ctx.beginPath();
-        ctx.arc(
-          centerX + p.x * scale,
-          centerY - p.y * scale,
-          2.5 + depth * 1.5,
-          0,
-          TAU
-        );
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 2.5 + depth * 1.5, 0, TAU);
         ctx.fill();
 
         ctx.fillStyle = `rgba(255, 100, 100, ${0.2 + depth * 0.2})`;
         ctx.beginPath();
-        ctx.arc(
-          centerX + p.x * scale,
-          centerY - p.y * scale,
-          4 + depth * 2,
-          0,
-          TAU
-        );
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 4 + depth * 2, 0, TAU);
         ctx.fill();
       } else {
         const color =
           compressionMode === "fourier"
-            ? { r: 100, g: 255, b: 150 }
-            : { r: 100, g: 150, b: 255 };
+            ? { r: 100, g: 255, b: 150 } // green
+            : { r: 100, g: 150, b: 255 }; // blue
 
         const brightness = depth;
-        ctx.fillStyle = `rgba(${color.r * brightness}, ${
-          color.g * brightness
-        }, ${color.b}, ${0.4 + depth * 0.5})`;
+        ctx.fillStyle = `rgba(${color.r * brightness}, ${color.g * brightness}, ${color.b}, ${0.4 + depth * 0.5})`;
         ctx.beginPath();
-        ctx.arc(
-          centerX + p.x * scale,
-          centerY - p.y * scale,
-          1.5 + depth * 1.2,
-          0,
-          TAU
-        );
+        ctx.arc(centerX + p.x * scale, centerY - p.y * scale, 1.5 + depth * 1.2, 0, TAU);
         ctx.fill();
       }
     });
-  }, [
-    rotation,
-    scannedPoints,
-    phaseMap,
-    viewMode,
-    phaseResolution,
-    compressionMode,
-    fourierData,
-  ]);
+  }, [rotation, scannedPoints, phaseMap, viewMode, phaseResolution, compressionMode, fourierData]);
 
   return (
     <div className="p-6 max-w-7xl mx-auto bg-slate-950 text-white min-h-screen font-mono">
@@ -454,12 +459,8 @@ const DephazePhaseMap = () => {
         <h1 className="text-4xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase tracking-wider">
           DEPHAZE Phase Map
         </h1>
-        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">
-          AMORPHOUS GEOMETRY + FOURIER COMPRESSION
-        </p>
-        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">
-          Ω₀ → φ³ ↔ φ⁻³ → Ξ=1
-        </p>
+        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">IMAGO FIELD (AUDIO-STYLE) + MIRROR-Φ FOURIER</p>
+        <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">Ω₀ → φ³ ↔ φ⁻³ → Ξ=1</p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -473,13 +474,13 @@ const DephazePhaseMap = () => {
                 <span className="text-purple-400">Ω₀:</span> Invariant zero-point
               </p>
               <p>
-                <span className="text-purple-400">φ³:</span> Generative field
+                <span className="text-purple-400">φ³:</span> Generative field (Imago Field F)
               </p>
               <p>
-                <span className="text-purple-400">φ⁻³:</span> Measured pattern
+                <span className="text-purple-400">φ⁻³:</span> Measured pattern (scan points)
               </p>
               <p>
-                <span className="text-purple-400">Ξ:</span> φ³/φ⁻³ = 1
+                <span className="text-purple-400">Ξ:</span> Dir-invariant via Lamé (PHI3)
               </p>
             </div>
           </div>
@@ -489,17 +490,11 @@ const DephazePhaseMap = () => {
               <Database size={14} /> MESH (φ⁻³)
             </h3>
             <div className="bg-black bg-opacity-50 p-3 rounded-lg mb-2">
-              <p className="text-[8px] text-slate-500 uppercase tracking-wider">
-                Storage
-              </p>
-              <p className="text-2xl font-black text-red-500">
-                {(metrics.meshSize / 1024).toFixed(1)} KB
-              </p>
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Storage</p>
+              <p className="text-2xl font-black text-red-500">{(metrics.meshSize / 1024).toFixed(1)} KB</p>
             </div>
             <div className="bg-black bg-opacity-50 p-3 rounded-lg">
-              <p className="text-[8px] text-slate-500 uppercase tracking-wider">
-                Points
-              </p>
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Points</p>
               <p className="text-xl font-bold text-white">{scanDensity}</p>
             </div>
           </div>
@@ -512,52 +507,42 @@ const DephazePhaseMap = () => {
               <button
                 onClick={() => setCompressionMode("spatial")}
                 className={`p-2 rounded-lg text-[9px] font-bold transition ${
-                  compressionMode === "spatial"
-                    ? "bg-blue-600 text-white"
-                    : "bg-slate-800 text-slate-400"
+                  compressionMode === "spatial" ? "bg-blue-600 text-white" : "bg-slate-800 text-slate-400"
                 }`}
               >
                 SPATIAL
-                <div className="text-[7px] opacity-70">Phase Map</div>
+                <div className="text-[7px] opacity-70">F-map</div>
               </button>
               <button
                 onClick={() => setCompressionMode("fourier")}
                 className={`p-2 rounded-lg text-[9px] font-bold transition ${
-                  compressionMode === "fourier"
-                    ? "bg-green-600 text-white"
-                    : "bg-slate-800 text-slate-400"
+                  compressionMode === "fourier" ? "bg-green-600 text-white" : "bg-slate-800 text-slate-400"
                 }`}
               >
                 FOURIER
-                <div className="text-[7px] opacity-70">DFT</div>
+                <div className="text-[7px] opacity-70">Mirror-Φ DFT</div>
               </button>
             </div>
 
             {compressionMode === "fourier" && (
               <div className="mt-3 pt-3 border-t border-slate-700">
-                <p className="text-[8px] text-slate-400 mb-2 uppercase">
-                  Top-K Coefficients
-                </p>
+                <p className="text-[8px] text-slate-400 mb-2 uppercase">Top-K Coefficients</p>
                 <input
                   type="range"
-                  min="5"
-                  max="100"
-                  step="5"
+                  min="10"
+                  max="160"
+                  step="10"
                   value={fourierTopK}
                   onChange={(e) => setFourierTopK(parseInt(e.target.value))}
                   className="w-full h-1 bg-slate-800 rounded-lg"
                 />
                 <div className="flex justify-between text-[7px] text-slate-500 mt-1 mb-2">
-                  <span>Smooth (5)</span>
-                  <span>Detailed (100)</span>
+                  <span>Smooth (10)</span>
+                  <span>Detailed (160)</span>
                 </div>
-                <p className="text-center text-lg font-bold text-green-400">
-                  K = {fourierTopK}
-                </p>
+                <p className="text-center text-lg font-bold text-green-400">K = {fourierTopK}</p>
                 {fourierData && (
-                  <p className="text-center text-[7px] text-slate-500 mt-1">
-                    {fourierData.totalCoeffs} available
-                  </p>
+                  <p className="text-center text-[7px] text-slate-500 mt-1">{fourierData.totalCoeffs} available</p>
                 )}
               </div>
             )}
@@ -568,9 +553,7 @@ const DephazePhaseMap = () => {
               <Zap size={14} /> DEPHAZE (φ³)
             </h3>
             <div className="bg-black bg-opacity-50 p-3 rounded-lg mb-2">
-              <p className="text-[8px] text-slate-500 uppercase tracking-wider">
-                Storage
-              </p>
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Storage</p>
               <p className="text-2xl font-black text-blue-500">
                 {compressionMode === "fourier"
                   ? `${metrics.dephazeSize.toFixed(0)} B`
@@ -578,13 +561,9 @@ const DephazePhaseMap = () => {
               </p>
             </div>
             <div className="bg-black bg-opacity-50 p-3 rounded-lg">
-              <p className="text-[8px] text-slate-500 uppercase tracking-wider">
-                Method
-              </p>
+              <p className="text-[8px] text-slate-500 uppercase tracking-wider">Method</p>
               <p className="text-sm font-bold text-white">
-                {compressionMode === "fourier"
-                  ? `${fourierTopK} Fourier coeffs`
-                  : `${phaseResolution}² cells`}
+                {compressionMode === "fourier" ? `${fourierTopK} coeffs` : `${phaseResolution}² cells`}
               </p>
             </div>
           </div>
@@ -594,34 +573,14 @@ const DephazePhaseMap = () => {
               <Target size={14} /> Ξ Stability
             </h3>
             <div className="text-center mb-3">
-              <p className="text-4xl font-black text-white">
-                {metrics.xiStability}%
-              </p>
-              <p className="text-[8px] text-slate-500 mt-1">
-                Error: {metrics.avgError}%
-              </p>
+              <p className="text-4xl font-black text-white">{metrics.xiStability}%</p>
+              <p className="text-[8px] text-slate-500 mt-1">Error: {metrics.avgError}%</p>
             </div>
             <div className="text-center pt-3 border-t border-emerald-800">
-              <p
-                className={`text-4xl font-black ${
-                  compressionMode === "fourier"
-                    ? "text-green-400"
-                    : "text-emerald-400"
-                }`}
-              >
+              <p className={`text-4xl font-black ${compressionMode === "fourier" ? "text-green-400" : "text-emerald-400"}`}>
                 {metrics.compressionVsMesh}×
               </p>
-              <p className="text-[8px] text-slate-400 uppercase tracking-wider">
-                vs Mesh
-              </p>
-              {compressionMode === "fourier" &&
-                parseInt(metrics.compressionVsMesh, 10) > 50 && (
-                  <div className="mt-2 bg-green-900 bg-opacity-30 p-2 rounded">
-                    <p className="text-[8px] text-green-300 font-bold">
-                      🔥 EXTREME COMPRESSION!
-                    </p>
-                  </div>
-                )}
+              <p className="text-[8px] text-slate-400 uppercase tracking-wider">vs Mesh</p>
             </div>
           </div>
         </div>
@@ -631,25 +590,15 @@ const DephazePhaseMap = () => {
             <div className="absolute top-4 left-4 space-y-1.5 z-10 bg-black bg-opacity-60 p-3 rounded-lg backdrop-blur-sm">
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-red-500 rounded-full shadow-lg shadow-red-500/50" />
-                <span className="text-[9px] text-red-300 uppercase">
-                  φ⁻³ Mesh
-                </span>
+                <span className="text-[9px] text-red-300 uppercase">φ⁻³ Mesh</span>
               </div>
               <div className="flex items-center gap-2">
                 <div
                   className={`w-3 h-3 rounded-full shadow-lg ${
-                    compressionMode === "fourier"
-                      ? "bg-green-500 shadow-green-500/50"
-                      : "bg-blue-500 shadow-blue-500/50"
+                    compressionMode === "fourier" ? "bg-green-500 shadow-green-500/50" : "bg-blue-500 shadow-blue-500/50"
                   }`}
                 />
-                <span
-                  className={`text-[9px] uppercase ${
-                    compressionMode === "fourier"
-                      ? "text-green-300"
-                      : "text-blue-300"
-                  }`}
-                >
+                <span className={`text-[9px] uppercase ${compressionMode === "fourier" ? "text-green-300" : "text-blue-300"}`}>
                   φ³ {compressionMode === "fourier" ? "Fourier" : "Spatial"}
                 </span>
               </div>
@@ -659,9 +608,7 @@ const DephazePhaseMap = () => {
               <button
                 onClick={() => setViewMode("mesh")}
                 className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
-                  viewMode === "mesh"
-                    ? "bg-red-600"
-                    : "bg-slate-800 hover:bg-slate-700"
+                  viewMode === "mesh" ? "bg-red-600" : "bg-slate-800 hover:bg-slate-700"
                 }`}
               >
                 φ⁻³
@@ -669,9 +616,7 @@ const DephazePhaseMap = () => {
               <button
                 onClick={() => setViewMode("dephaze")}
                 className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
-                  viewMode === "dephaze"
-                    ? "bg-blue-600"
-                    : "bg-slate-800 hover:bg-slate-700"
+                  viewMode === "dephaze" ? "bg-blue-600" : "bg-slate-800 hover:bg-slate-700"
                 }`}
               >
                 φ³
@@ -679,9 +624,7 @@ const DephazePhaseMap = () => {
               <button
                 onClick={() => setViewMode("both")}
                 className={`px-3 py-1.5 text-[9px] font-bold rounded transition ${
-                  viewMode === "both"
-                    ? "bg-purple-600"
-                    : "bg-slate-800 hover:bg-slate-700"
+                  viewMode === "both" ? "bg-purple-600" : "bg-slate-800 hover:bg-slate-700"
                 }`}
               >
                 BOTH
@@ -701,9 +644,7 @@ const DephazePhaseMap = () => {
               className="cursor-grab active:cursor-grabbing w-full rounded-lg"
             />
 
-            <p className="text-center text-[8px] text-slate-500 mt-2 uppercase tracking-wider">
-              Drag to rotate
-            </p>
+            <p className="text-center text-[8px] text-slate-500 mt-2 uppercase tracking-wider">Drag to rotate</p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
@@ -717,15 +658,11 @@ const DephazePhaseMap = () => {
                 max="64"
                 step="8"
                 value={phaseResolution}
-                onChange={(e) =>
-                  setPhaseResolution(parseInt(e.target.value))
-                }
+                onChange={(e) => setPhaseResolution(parseInt(e.target.value))}
                 className="w-full h-2 bg-slate-800 rounded-lg"
               />
               <div className="text-center mt-3">
-                <p className="text-2xl font-black text-white">
-                  {phaseResolution}²
-                </p>
+                <p className="text-2xl font-black text-white">{phaseResolution}²</p>
               </div>
             </div>
 
@@ -736,7 +673,7 @@ const DephazePhaseMap = () => {
               <input
                 type="range"
                 min="200"
-                max="2000"
+                max="4000"
                 step="200"
                 value={scanDensity}
                 onChange={(e) => setScanDensity(parseInt(e.target.value))}
@@ -759,9 +696,7 @@ const DephazePhaseMap = () => {
                     : "bg-slate-800 text-slate-400 hover:bg-slate-700"
                 }`}
               >
-                <div className="text-lg mb-1">
-                  {type === "bumpy" ? "🌊" : type === "spike" ? "⚡" : "🧬"}
-                </div>
+                <div className="text-lg mb-1">{type === "bumpy" ? "🌊" : type === "spike" ? "⚡" : "🧬"}</div>
                 {type}
               </button>
             ))}
@@ -771,18 +706,12 @@ const DephazePhaseMap = () => {
 
       <div className="mt-6 bg-slate-900 bg-opacity-50 p-4 rounded-lg border border-slate-700">
         <p className="text-[9px] text-slate-400 text-center leading-relaxed">
-          <span
-            className={
-              compressionMode === "fourier" ? "text-green-400" : "text-purple-400"
-            }
-          >
-            {compressionMode === "fourier"
-              ? "🌊 FOURIER MODE:"
-              : "📊 SPATIAL MODE:"}
+          <span className={compressionMode === "fourier" ? "text-green-400" : "text-purple-400"}>
+            {compressionMode === "fourier" ? "🌊 FOURIER MODE:" : "📊 SPATIAL MODE:"}
           </span>{" "}
           {compressionMode === "fourier"
-            ? `Using ${fourierTopK} frequency coefficients to reconstruct amorphous geometry. Low-frequency components capture smooth surfaces with ${metrics.compressionVsMesh}× compression vs mesh.`
-            : `Using ${phaseResolution}×${phaseResolution} phase map cells. Spatial domain reconstruction with ${metrics.ratio}× compression.`}
+            ? `Mirror-φ DFT on Imago field F = log(R)*V(dir). This removes φ seam assumptions and typically lifts accuracy above the old ~94% plateau (given enough K).`
+            : `Spatial Imago field map (F-cells). Very accurate, fixed size vs scan density.`}
         </p>
       </div>
     </div>
