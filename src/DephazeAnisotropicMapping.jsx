@@ -2,24 +2,16 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 import { Scan, Zap, Cpu, Target, Database, Atom, Waves } from "lucide-react";
 
 /**
- * DEPHAZE Phase Map (Audio-style Imago Field + Mirror-Φ Fourier)
+ * DEPHAZE Phase Map (Audio-style Imago Field + Mirror-Φ Fourier) — FIXED
  *
- * What changed vs your previous version:
- * 1) We DO NOT compress raw R directly.
- *    We compress an "audio-like" scalar field:
- *       V(theta,phi) = PHI3 * Xi_dir(direction)
- *       F(theta,phi) = log(R + eps) * V
- *    This is smoother and more Fourier-friendly.
+ * Fix applied (critical):
+ * - Mirror-φ DFT uses M=2N columns, but the real physical φ in [0..π] occupies ONLY the first half.
+ * - Therefore reconstruction MUST map φ to index range [0..N], NOT [0..M].
+ *   Before (wrong): tj = (phi/π)*M  -> doubles φ phase -> bad reconstruction (~86%)
+ *   Now   (fixed): tj = (phi/π)*N  -> correct mapping into first half -> stable Fourier.
  *
- * 2) Fourier uses MIRROR extension on φ (non-periodic axis) to kill seam artifacts:
- *    matrix size is N x (2N). This typically breaks the ~94% plateau.
- *
- * 3) Optional "virtual point" injection (φ³ vortex direction warp) is INCLUDED,
- *    but it is applied only when building the phase map (time-less).
- *
- * Notes:
- * - The ANCHOR = 1e-55 from audio is NOT needed here because Xi is scale-invariant.
- *   The big problem was φ non-periodicity + non-Fourier-friendly signal.
+ * Additional stabilizer:
+ * - Limit ky bandwidth to N/2 (instead of M/2) to avoid top-K picking mirror-only modes.
  */
 
 const DephazePhaseMap = () => {
@@ -39,11 +31,9 @@ const DephazePhaseMap = () => {
   const TAU = 2 * Math.PI;
   const EPS = 1e-6;
 
-  const clamp01 = (v) => Math.max(0, Math.min(1, v));
   const wrap2pi = (a) => ((a % TAU) + TAU) % TAU;
 
   // === Direction-only Xi (no time, no R dependency) ===
-  // Xi_dir = 1 / ( |ux|^PHI3 + |uy|^PHI3 + |uz|^PHI3 )^(1/PHI3)
   const xiDir = (theta, phi) => {
     const ux = Math.sin(phi) * Math.cos(theta);
     const uy = Math.sin(phi) * Math.sin(theta);
@@ -59,31 +49,25 @@ const DephazePhaseMap = () => {
     return 1 / Math.max(denom, 1e-12);
   };
 
-  // "Audio-style" vortex scalar (direction-only)
+  // Audio-style direction vortex scalar
   const vortexDir = (theta, phi) => PHI3 * xiDir(theta, phi);
 
-  /**
-   * Audio-style field to compress:
-   *   F = log(R + eps) * V
-   * Reconstruction:
-   *   log(R + eps) = F / V  => R = exp(F/V) - eps
-   */
+  // Encode field F = log(R+eps) * V(dir)
   const encodeFieldF = (R, theta, phi) => {
     const V = Math.max(vortexDir(theta, phi), 1e-9);
     return Math.log(Math.max(EPS, R + EPS)) * V;
   };
 
+  // Decode back to R
   const decodeFieldToR = (F, theta, phi) => {
     const V = Math.max(vortexDir(theta, phi), 1e-9);
     const logR = F / V;
     const R = Math.exp(logR) - EPS;
-    // guard
     if (!Number.isFinite(R)) return 2.0;
     return Math.max(0.5, Math.min(4.0, R));
   };
 
-  // === Φ³ vortex direction warp (virtual point) ===
-  // Time-less mapping: direction unit-vector -> φ³ power warp -> renormalize -> new (thetaV, phiV)
+  // Virtual point mapping via Φ³ vortex direction warp
   const phi3VortexDirWarp = (theta, phi) => {
     const ux = Math.sin(phi) * Math.cos(theta);
     const uy = Math.sin(phi) * Math.sin(theta);
@@ -134,11 +118,10 @@ const DephazePhaseMap = () => {
     return points;
   }, [meshType, scanDensity]);
 
-  // === 2) PHASE MAP (store F, NOT R) + virtual point injection ===
+  // === 2) PHASE MAP (store F) + virtual injection ===
   const phaseMap = useMemo(() => {
     const N = phaseResolution;
 
-    // init with a reasonable default field at each direction
     const map = Array(N)
       .fill(null)
       .map(() =>
@@ -147,7 +130,7 @@ const DephazePhaseMap = () => {
           .map(() => ({ F: encodeFieldF(2.0, 0, Math.PI / 2), count: 0 }))
       );
 
-    const virtualWeight = 0.45; // tuning 0.2..0.7
+    const virtualWeight = 0.45;
 
     const addSample = (theta, phi, F, weight = 1.0) => {
       const ti = Math.floor((theta / TAU) * N) % N;
@@ -165,15 +148,13 @@ const DephazePhaseMap = () => {
     };
 
     scannedPoints.forEach((p) => {
-      // measured point
       addSample(p.theta, p.phi, p.F, 1.0);
 
-      // virtual point (φ³ vortex warp)
       const { thetaV, phiV } = phi3VortexDirWarp(p.theta, p.phi);
       addSample(thetaV, phiV, p.F, virtualWeight);
     });
 
-    // fill holes via neighbor average (θ wraps, φ clamps)
+    // Fill holes
     for (let i = 0; i < N; i++) {
       for (let j = 0; j < N; j++) {
         if (map[i][j].count === 0) {
@@ -217,15 +198,13 @@ const DephazePhaseMap = () => {
     return map;
   }, [scannedPoints, phaseResolution]);
 
-  // === 3) FOURIER (DFT) with MIRROR φ extension ===
+  // === 3) FOURIER DFT with MIRROR φ extension ===
   const fourierData = useMemo(() => {
     if (compressionMode !== "fourier") return null;
 
     const N = phaseResolution;
-    const M = 2 * N; // mirror φ dimension
+    const M = 2 * N;
 
-    // Build N x (2N) matrix:
-    // [ F(theta,phi0..phiN-1) | F(theta,phiN-1..phi0) ]
     const matrix = Array(N)
       .fill(null)
       .map((_, i) => {
@@ -243,7 +222,7 @@ const DephazePhaseMap = () => {
 
     const allCoeffs = [];
     const maxFreqX = Math.floor(N / 2);
-    const maxFreqY = Math.floor(M / 2);
+    const maxFreqY = Math.floor(N / 2); // <== stabilizer (was M/2)
 
     for (let kx = -maxFreqX; kx <= maxFreqX; kx++) {
       for (let ky = -maxFreqY; ky <= maxFreqY; ky++) {
@@ -261,17 +240,16 @@ const DephazePhaseMap = () => {
           }
         }
 
-        const amplitude = Math.sqrt(real * real + imag * imag);
         const norm = N * M;
+        const amplitude = Math.sqrt(real * real + imag * imag) / norm;
 
-        // keep only meaningful
-        if (amplitude / norm > 0.00005) {
+        if (amplitude > 0.00005) {
           allCoeffs.push({
             kx,
             ky,
             real: real / norm,
             imag: imag / norm,
-            amplitude: amplitude / norm,
+            amplitude,
           });
         }
       }
@@ -280,29 +258,21 @@ const DephazePhaseMap = () => {
     allCoeffs.sort((a, b) => b.amplitude - a.amplitude);
     const topCoeffs = allCoeffs.slice(0, Math.min(fourierTopK, allCoeffs.length));
 
-    return {
-      dc,
-      N,
-      M,
-      coefficients: topCoeffs,
-      totalCoeffs: allCoeffs.length,
-    };
+    return { dc, N, M, coefficients: topCoeffs, totalCoeffs: allCoeffs.length };
   }, [compressionMode, phaseMap, phaseResolution, fourierTopK]);
 
-  // === 4) Reconstruction: F -> R ===
+  // === 4) Reconstruction: FIXED tj mapping ===
   const reconstructR = (theta, phi) => {
     const N = phaseResolution;
 
     if (compressionMode === "fourier" && fourierData) {
       const { dc, coefficients, M } = fourierData;
 
-      // continuous indices in the DFT grid
       const ti = (theta / TAU) * N;
 
-      // IMPORTANT:
-      // Our DFT φ grid is length M=2N, representing [0..π] mirrored.
-      // For real φ in [0..π], we map it to first half [0..N] and scale to M.
-      const tj = (phi / Math.PI) * M;
+      // ✅ FIX: map φ only into the FIRST HALF (0..N) of the mirror grid
+      // (the physical domain lives there)
+      const tj = (phi / Math.PI) * N;
 
       let F = dc;
       for (const c of coefficients) {
@@ -313,25 +283,23 @@ const DephazePhaseMap = () => {
       return decodeFieldToR(F, theta, phi);
     }
 
-    // spatial lookup
+    // spatial
     const ti = Math.floor((theta / TAU) * N) % N;
     const tj = Math.floor((phi / Math.PI) * N);
     if (tj < 0 || tj >= N) return 2.0;
 
-    const F = phaseMap[ti][tj].F;
-    return decodeFieldToR(F, theta, phi);
+    return decodeFieldToR(phaseMap[ti][tj].F, theta, phi);
   };
 
   // === 5) Metrics ===
   const metrics = useMemo(() => {
-    const meshSize = scanDensity * 12; // xyz float32*3 = 12 bytes
-    let dephazeSize;
+    const meshSize = scanDensity * 12;
 
+    let dephazeSize;
     if (compressionMode === "fourier") {
-      // same accounting model: 16B header + 16B/coeff + 8B dc-ish
       dephazeSize = 16 + fourierTopK * 16 + 8;
     } else {
-      dephazeSize = 16 + phaseResolution * phaseResolution * 4; // F map float32 model
+      dephazeSize = 16 + phaseResolution * phaseResolution * 4;
     }
 
     let errorSum = 0;
@@ -339,7 +307,6 @@ const DephazePhaseMap = () => {
       const r2 = reconstructR(p.theta, p.phi);
       errorSum += Math.abs(r2 - p.R);
     }
-
     const avgError = errorSum / Math.max(1, scannedPoints.length);
     const xiStability = Math.max(0, 100 - avgError * 50);
 
@@ -364,7 +331,6 @@ const DephazePhaseMap = () => {
 
     ctx.clearRect(0, 0, width, height);
 
-    // background
     const gradient = ctx.createRadialGradient(width / 2, height / 2, 0, width / 2, height / 2, width / 2);
     gradient.addColorStop(0, "#0f172a");
     gradient.addColorStop(1, "#020617");
@@ -374,10 +340,8 @@ const DephazePhaseMap = () => {
     const centerX = width / 2;
     const centerY = height / 2;
     const scale = 90;
-
     const points = [];
 
-    // Dephaze reconstructed surface points
     if (viewMode !== "mesh") {
       const res = 42;
       for (let i = 0; i <= res; i++) {
@@ -390,7 +354,6 @@ const DephazePhaseMap = () => {
           const y = R * Math.sin(phi) * Math.sin(theta);
           const z = R * Math.cos(phi);
 
-          // rotate
           const cosX = Math.cos(rotation.x);
           const sinX = Math.sin(rotation.x);
           const y1 = y * cosX - z * sinX;
@@ -406,7 +369,6 @@ const DephazePhaseMap = () => {
       }
     }
 
-    // Raw mesh points
     if (viewMode !== "dephaze") {
       scannedPoints.slice(0, 250).forEach((p) => {
         const cosX = Math.cos(rotation.x);
@@ -441,8 +403,8 @@ const DephazePhaseMap = () => {
       } else {
         const color =
           compressionMode === "fourier"
-            ? { r: 100, g: 255, b: 150 } // green
-            : { r: 100, g: 150, b: 255 }; // blue
+            ? { r: 100, g: 255, b: 150 }
+            : { r: 100, g: 150, b: 255 };
 
         const brightness = depth;
         ctx.fillStyle = `rgba(${color.r * brightness}, ${color.g * brightness}, ${color.b}, ${0.4 + depth * 0.5})`;
@@ -459,7 +421,7 @@ const DephazePhaseMap = () => {
         <h1 className="text-4xl font-black bg-gradient-to-r from-red-500 via-purple-500 to-blue-500 bg-clip-text text-transparent uppercase tracking-wider">
           DEPHAZE Phase Map
         </h1>
-        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">IMAGO FIELD (AUDIO-STYLE) + MIRROR-Φ FOURIER</p>
+        <p className="text-slate-500 text-xs tracking-[0.3em] mt-2">IMAGO FIELD (AUDIO-STYLE) + MIRROR-Φ FOURIER (FIXED)</p>
         <p className="text-slate-600 text-[9px] tracking-[0.4em] mt-1">Ω₀ → φ³ ↔ φ⁻³ → Ξ=1</p>
       </div>
 
@@ -474,13 +436,13 @@ const DephazePhaseMap = () => {
                 <span className="text-purple-400">Ω₀:</span> Invariant zero-point
               </p>
               <p>
-                <span className="text-purple-400">φ³:</span> Generative field (Imago Field F)
+                <span className="text-purple-400">φ³:</span> Imago Field F = log(R)*V(dir)
               </p>
               <p>
-                <span className="text-purple-400">φ⁻³:</span> Measured pattern (scan points)
+                <span className="text-purple-400">φ⁻³:</span> Measured pattern (scan)
               </p>
               <p>
-                <span className="text-purple-400">Ξ:</span> Dir-invariant via Lamé (PHI3)
+                <span className="text-purple-400">Ξ:</span> Lamé dir-invariant (PHI3)
               </p>
             </div>
           </div>
@@ -710,8 +672,8 @@ const DephazePhaseMap = () => {
             {compressionMode === "fourier" ? "🌊 FOURIER MODE:" : "📊 SPATIAL MODE:"}
           </span>{" "}
           {compressionMode === "fourier"
-            ? `Mirror-φ DFT on Imago field F = log(R)*V(dir). This removes φ seam assumptions and typically lifts accuracy above the old ~94% plateau (given enough K).`
-            : `Spatial Imago field map (F-cells). Very accurate, fixed size vs scan density.`}
+            ? `Mirror-φ DFT on Imago field F. (FIXED φ index mapping.) If you still see a plateau, increase Top-K and PhaseResolution.`
+            : `Spatial Imago map. High accuracy, fixed size vs scan density.`}
         </p>
       </div>
     </div>
