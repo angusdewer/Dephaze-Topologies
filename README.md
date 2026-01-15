@@ -5,7 +5,7 @@ where storage size does not scale with geometric detail.
 ### The obsolescence of polygons. The emergence of implicit topology.
 
 [![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen?style=for-the-badge)](https://dephaze-topologies.vercel.app/)
-[![License](https://img.shields.io/badge/License-Academic-blue?style=for-the-badge)](https://zenodo.org/)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.18254425-blue?style=for-the-badge)](https://doi.org/10.5281/zenodo.18254425)
 
 **DEPHAZE is a geometry representation that is not stored as triangles.**
 Geometry is resolved locally as a phase-stabilized generative field
